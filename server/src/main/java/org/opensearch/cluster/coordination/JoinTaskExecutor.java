@@ -31,6 +31,7 @@
 
 package org.opensearch.cluster.coordination;
 
+import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.LegacyESVersion;
 import org.opensearch.Version;
@@ -59,14 +60,18 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 import static org.opensearch.cluster.decommission.DecommissionHelper.nodeCommissioned;
 import static org.opensearch.gateway.GatewayService.STATE_NOT_RECOVERED_BLOCK;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_CLUSTER_PUBLICATION_REPO_NAME_ATTRIBUTES;
 import static org.opensearch.node.remotestore.RemoteStoreNodeService.CompatibilityMode;
+import static org.opensearch.node.remotestore.RemoteStoreNodeService.CompatibilityMode.MIXED;
 import static org.opensearch.node.remotestore.RemoteStoreNodeService.CompatibilityMode.STRICT;
 import static org.opensearch.node.remotestore.RemoteStoreNodeService.REMOTE_STORE_COMPATIBILITY_MODE_SETTING;
 
@@ -79,7 +84,7 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
 
     private final AllocationService allocationService;
 
-    private final Logger logger;
+    private static Logger logger = LogManager.getLogger(JoinTaskExecutor.class);
     private final RerouteService rerouteService;
     private final TransportService transportService;
 
@@ -145,7 +150,7 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
         RemoteStoreNodeService remoteStoreNodeService
     ) {
         this.allocationService = allocationService;
-        this.logger = logger;
+        JoinTaskExecutor.logger = logger;
         this.rerouteService = rerouteService;
         this.transportService = transportService;
         this.remoteStoreNodeService = remoteStoreNodeService;
@@ -181,12 +186,13 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
 
         DiscoveryNodes.Builder nodesBuilder = DiscoveryNodes.builder(newState.nodes());
 
-        // TODO: We are using one of the existing node to build the repository metadata, this will need to be updated
-        // once we start supporting mixed compatibility mode. An optimization can be done as this will get invoked
+        // An optimization can be done as this will get invoked
         // for every set of node join task which we can optimize to not compute if cluster state already has
         // repository information.
+        Optional<DiscoveryNode> remoteDN = currentNodes.getNodes().values().stream().filter(DiscoveryNode::isRemoteStoreNode).findFirst();
+        DiscoveryNode dn = remoteDN.orElseGet(() -> (currentNodes.getNodes().values()).stream().findFirst().get());
         RepositoriesMetadata repositoriesMetadata = remoteStoreNodeService.updateRepositoriesMetadata(
-            (currentNodes.getNodes().values()).stream().findFirst().get(),
+            dn,
             currentState.getMetadata().custom(RepositoriesMetadata.TYPE)
         );
 
@@ -217,6 +223,16 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
                     // would guarantee that a decommissioned node would never be able to join the cluster and ensures correctness
                     ensureNodeCommissioned(node, currentState.metadata());
                     nodesBuilder.add(node);
+
+                    if (remoteDN.isEmpty() && node.isRemoteStoreNode()) {
+                        // This is hit only on cases where we encounter first remote node
+                        logger.info("Updating system repository now for remote store");
+                        repositoriesMetadata = remoteStoreNodeService.updateRepositoriesMetadata(
+                            node,
+                            currentState.getMetadata().custom(RepositoriesMetadata.TYPE)
+                        );
+                    }
+
                     nodesChanged = true;
                     minClusterNodeVersion = Version.min(minClusterNodeVersion, node.getVersion());
                     maxClusterNodeVersion = Version.max(maxClusterNodeVersion, node.getVersion());
@@ -504,7 +520,7 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
             );
         }
 
-        ensureRemoteStoreNodesCompatibility(joiningNode, currentNodes, metadata);
+        ensureRemoteRepositoryCompatibility(joiningNode, currentNodes, metadata);
     }
 
     /**
@@ -537,6 +553,30 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
         }
     }
 
+    public static void ensureRemoteRepositoryCompatibility(DiscoveryNode joiningNode, DiscoveryNodes currentNodes, Metadata metadata) {
+        List<DiscoveryNode> existingNodes = new ArrayList<>(currentNodes.getNodes().values());
+
+        boolean isClusterRemoteStoreEnabled = existingNodes.stream().anyMatch(DiscoveryNode::isRemoteStoreNode);
+        if (isClusterRemoteStoreEnabled || joiningNode.isRemoteStoreNode()) {
+            ensureRemoteStoreNodesCompatibility(joiningNode, currentNodes, metadata);
+        } else {
+            ensureRemoteClusterStateNodesCompatibility(joiningNode, currentNodes);
+        }
+    }
+
+    private static void ensureRemoteClusterStateNodesCompatibility(DiscoveryNode joiningNode, DiscoveryNodes currentNodes) {
+        List<DiscoveryNode> existingNodes = new ArrayList<>(currentNodes.getNodes().values());
+
+        assert existingNodes.isEmpty() == false;
+        Optional<DiscoveryNode> remotePublicationNode = existingNodes.stream()
+            .filter(DiscoveryNode::isRemoteStatePublicationEnabled)
+            .findFirst();
+
+        if (remotePublicationNode.isPresent() && joiningNode.isRemoteStatePublicationEnabled()) {
+            ensureRepositoryCompatibility(joiningNode, remotePublicationNode.get(), REMOTE_CLUSTER_PUBLICATION_REPO_NAME_ATTRIBUTES);
+        }
+    }
+
     /**
      * The method ensures homogeneity -
      * 1. The joining node has to be a remote store backed if it's joining a remote store backed cluster. Validates
@@ -552,34 +592,33 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
      *       needs to be modified.
      */
     private static void ensureRemoteStoreNodesCompatibility(DiscoveryNode joiningNode, DiscoveryNodes currentNodes, Metadata metadata) {
+
         List<DiscoveryNode> existingNodes = new ArrayList<>(currentNodes.getNodes().values());
 
         assert existingNodes.isEmpty() == false;
 
-        // TODO: The below check is valid till we don't support migration, once we start supporting migration a remote
-        // store node will be able to join a non remote store cluster and vice versa. #7986
         CompatibilityMode remoteStoreCompatibilityMode = REMOTE_STORE_COMPATIBILITY_MODE_SETTING.get(metadata.settings());
+
+        List<String> reposToSkip = new ArrayList<>(1);
+        Optional<DiscoveryNode> remoteRoutingTableNode = existingNodes.stream()
+            .filter(
+                node -> node.getAttributes().get(RemoteStoreNodeAttribute.REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY) != null
+            )
+            .findFirst();
+        // If none of the existing nodes have routing table repo, then we skip this repo check if present in joining node.
+        // This ensures a new node with remote routing table repo is able to join the cluster.
+        if (remoteRoutingTableNode.isEmpty()) {
+            String joiningNodeRepoName = joiningNode.getAttributes()
+                .get(RemoteStoreNodeAttribute.REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY);
+            if (joiningNodeRepoName != null) {
+                reposToSkip.add(joiningNodeRepoName);
+            }
+        }
+
         if (STRICT.equals(remoteStoreCompatibilityMode)) {
-            DiscoveryNode existingNode = existingNodes.get(0);
+            DiscoveryNode existingNode = remoteRoutingTableNode.orElseGet(() -> existingNodes.get(0));
             if (joiningNode.isRemoteStoreNode()) {
-                if (existingNode.isRemoteStoreNode()) {
-                    RemoteStoreNodeAttribute joiningRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(joiningNode);
-                    RemoteStoreNodeAttribute existingRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(existingNode);
-                    if (existingRemoteStoreNodeAttribute.equals(joiningRemoteStoreNodeAttribute) == false) {
-                        throw new IllegalStateException(
-                            "a remote store node ["
-                                + joiningNode
-                                + "] is trying to join a remote store cluster with incompatible node attributes in "
-                                + "comparison with existing node ["
-                                + existingNode
-                                + "]"
-                        );
-                    }
-                } else {
-                    throw new IllegalStateException(
-                        "a remote store node [" + joiningNode + "] is trying to join a non remote store cluster"
-                    );
-                }
+                ensureRemoteStoreNodesCompatibility(joiningNode, existingNode, reposToSkip);
             } else {
                 if (existingNode.isRemoteStoreNode()) {
                     throw new IllegalStateException(
@@ -587,6 +626,68 @@ public class JoinTaskExecutor implements ClusterStateTaskExecutor<JoinTaskExecut
                     );
                 }
             }
+        } else {
+            if (MIXED.equals(remoteStoreCompatibilityMode)) {
+                if (joiningNode.getVersion().after(currentNodes.getMaxNodeVersion())) {
+                    String reason = String.format(
+                        Locale.ROOT,
+                        "remote migration : a node [%s] of higher version [%s] is not allowed to join a cluster with maximum version [%s]",
+                        joiningNode,
+                        joiningNode.getVersion(),
+                        currentNodes.getMaxNodeVersion()
+                    );
+                    logger.warn(reason);
+                    throw new IllegalStateException(reason);
+                }
+                if (joiningNode.isRemoteStoreNode()) {
+                    Optional<DiscoveryNode> remoteDN = remoteRoutingTableNode.isPresent()
+                        ? remoteRoutingTableNode
+                        : existingNodes.stream().filter(DiscoveryNode::isRemoteStoreNode).findFirst();
+                    remoteDN.ifPresent(discoveryNode -> ensureRemoteStoreNodesCompatibility(joiningNode, discoveryNode, reposToSkip));
+                }
+            }
+        }
+    }
+
+    private static void ensureRemoteStoreNodesCompatibility(
+        DiscoveryNode joiningNode,
+        DiscoveryNode existingNode,
+        List<String> reposToSkip
+    ) {
+        if (joiningNode.isRemoteStoreNode()) {
+            if (existingNode.isRemoteStoreNode()) {
+                RemoteStoreNodeAttribute joiningRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(joiningNode);
+                RemoteStoreNodeAttribute existingRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(existingNode);
+                if (existingRemoteStoreNodeAttribute.equalsWithRepoSkip(joiningRemoteStoreNodeAttribute, reposToSkip) == false) {
+                    throw new IllegalStateException(
+                        "a remote store node ["
+                            + joiningNode
+                            + "] is trying to join a remote store cluster with incompatible node attributes in "
+                            + "comparison with existing node ["
+                            + existingNode
+                            + "]"
+                    );
+                }
+            } else {
+                throw new IllegalStateException("a remote store node [" + joiningNode + "] is trying to join a non remote store cluster");
+            }
+        }
+    }
+
+    private static void ensureRepositoryCompatibility(DiscoveryNode joiningNode, DiscoveryNode existingNode, List<String> reposToValidate) {
+
+        RemoteStoreNodeAttribute joiningRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(joiningNode);
+        RemoteStoreNodeAttribute existingRemoteStoreNodeAttribute = new RemoteStoreNodeAttribute(existingNode);
+
+        if (existingRemoteStoreNodeAttribute.equalsForRepositories(joiningRemoteStoreNodeAttribute, reposToValidate) == false) {
+            throw new IllegalStateException(
+                "a remote store node ["
+                    + joiningNode
+                    + "] is trying to join a remote store cluster with incompatible node attributes in "
+                    + "comparison with existing node ["
+                    + existingNode
+                    + "]"
+            );
         }
     }
 

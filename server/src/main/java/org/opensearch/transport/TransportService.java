@@ -66,6 +66,7 @@ import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.service.ReportingService;
 import org.opensearch.core.transport.TransportResponse;
 import org.opensearch.node.NodeClosedException;
+import org.opensearch.ratelimitting.admissioncontrol.enums.AdmissionControlActionType;
 import org.opensearch.tasks.Task;
 import org.opensearch.tasks.TaskManager;
 import org.opensearch.telemetry.tracing.Span;
@@ -758,7 +759,7 @@ public class TransportService extends AbstractLifecycleComponent
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeOptionalWriteable(discoveryNode);
+            out.writeOptionalWriteable((stream, node) -> node.writeToWithAttribute(stream), discoveryNode);
             clusterName.writeTo(out);
             if (out.getVersion().before(Version.V_1_0_0)) {
                 out.writeVersion(LegacyESVersion.V_7_10_2);
@@ -878,19 +879,10 @@ public class TransportService extends AbstractLifecycleComponent
         final TransportRequestOptions options,
         final TransportResponseHandler<T> handler
     ) {
-        if (connection == localNodeConnection) {
-            // See please https://github.com/opensearch-project/OpenSearch/issues/10291
-            sendRequestAsync(connection, action, request, options, handler);
-        } else {
-            final Span span = tracer.startSpan(SpanBuilder.from(action, connection));
-            try (SpanScope spanScope = tracer.withSpanInScope(span)) {
-                TransportResponseHandler<T> traceableTransportResponseHandler = TraceableTransportResponseHandler.create(
-                    handler,
-                    span,
-                    tracer
-                );
-                sendRequestAsync(connection, action, request, options, traceableTransportResponseHandler);
-            }
+        final Span span = tracer.startSpan(SpanBuilder.from(action, connection));
+        try (SpanScope spanScope = tracer.withSpanInScope(span)) {
+            TransportResponseHandler<T> traceableTransportResponseHandler = TraceableTransportResponseHandler.create(handler, span, tracer);
+            sendRequestAsync(connection, action, request, options, traceableTransportResponseHandler);
         }
     }
 
@@ -1211,6 +1203,44 @@ public class TransportService extends AbstractLifecycleComponent
     ) {
         validateActionName(action);
         handler = interceptor.interceptHandler(action, executor, forceExecution, handler);
+        RequestHandlerRegistry<Request> reg = new RequestHandlerRegistry<>(
+            action,
+            requestReader,
+            taskManager,
+            handler,
+            executor,
+            forceExecution,
+            canTripCircuitBreaker
+        );
+        transport.registerRequestHandler(reg);
+    }
+
+    /**
+     * Registers a new request handler with admission control support
+     *
+     * @param action                The action the request handler is associated with
+     * @param executor              The executor the request handling will be executed on
+     * @param forceExecution        Force execution on the executor queue and never reject it
+     * @param canTripCircuitBreaker Check the request size and raise an exception in case the limit is breached.
+     * @param admissionControlActionType Admission control based on resource usage limits of provided action type
+     * @param requestReader               The request class that will be used to construct new instances for streaming
+     * @param handler               The handler itself that implements the request handling
+     */
+    public <Request extends TransportRequest> void registerRequestHandler(
+        String action,
+        String executor,
+        boolean forceExecution,
+        boolean canTripCircuitBreaker,
+        AdmissionControlActionType admissionControlActionType,
+        Writeable.Reader<Request> requestReader,
+        TransportRequestHandler<Request> handler
+    ) {
+        validateActionName(action);
+        if (admissionControlActionType != null) {
+            handler = interceptor.interceptHandler(action, executor, forceExecution, handler, admissionControlActionType);
+        } else {
+            handler = interceptor.interceptHandler(action, executor, forceExecution, handler);
+        }
         RequestHandlerRegistry<Request> reg = new RequestHandlerRegistry<>(
             action,
             requestReader,

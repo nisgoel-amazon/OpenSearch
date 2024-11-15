@@ -81,6 +81,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.cache.bitset.BitsetFilterCache;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.aggregations.LeafBucketCollector;
 import org.opensearch.test.IndexSettingsModule;
@@ -262,6 +263,9 @@ public class ContextIndexSearcherTests extends OpenSearchTestCase {
         SearchContext searchContext = mock(SearchContext.class);
         IndexShard indexShard = mock(IndexShard.class);
         when(searchContext.indexShard()).thenReturn(indexShard);
+        SearchOperationListener searchOperationListener = new SearchOperationListener() {
+        };
+        when(indexShard.getSearchOperationListener()).thenReturn(searchOperationListener);
         when(searchContext.bucketCollectorProcessor()).thenReturn(SearchContext.NO_OP_BUCKET_COLLECTOR_PROCESSOR);
         ContextIndexSearcher searcher = new ContextIndexSearcher(
             filteredReader,
@@ -393,8 +397,8 @@ public class ContextIndexSearcherTests extends OpenSearchTestCase {
                     null,
                     searchContext
                 );
-                // Case 1: Verify getSlices return null when concurrent segment search is disabled
-                assertNull(searcher.getSlices());
+                // Case 1: Verify getSlices returns not null when concurrent segment search is disabled
+                assertEquals(1, searcher.getSlices().length);
 
                 // Case 2: Verify the slice count when custom max slice computation is used
                 searcher = new ContextIndexSearcher(

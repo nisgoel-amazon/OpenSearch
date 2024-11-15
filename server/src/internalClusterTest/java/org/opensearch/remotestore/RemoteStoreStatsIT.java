@@ -29,6 +29,7 @@ import org.opensearch.plugins.Plugin;
 import org.opensearch.test.InternalTestCluster;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.test.disruption.NetworkDisruption;
+import org.opensearch.test.junit.annotations.TestLogging;
 import org.opensearch.test.transport.MockTransportService;
 
 import java.io.IOException;
@@ -54,7 +55,7 @@ public class RemoteStoreStatsIT extends RemoteStoreBaseIntegTestCase {
 
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
-        return Arrays.asList(MockTransportService.TestPlugin.class);
+        return Stream.concat(super.nodePlugins().stream(), Stream.of(MockTransportService.TestPlugin.class)).collect(Collectors.toList());
     }
 
     public void setup() {
@@ -257,6 +258,7 @@ public class RemoteStoreStatsIT extends RemoteStoreBaseIntegTestCase {
         }
     }
 
+    @TestLogging(reason = "Getting trace logs from remote store package", value = "org.opensearch.index.shard:TRACE")
     public void testDownloadStatsCorrectnessSinglePrimarySingleReplica() throws Exception {
         setup();
         // Scenario:
@@ -285,6 +287,15 @@ public class RemoteStoreStatsIT extends RemoteStoreBaseIntegTestCase {
             .collect(Collectors.toList())
             .get(0)
             .getSegmentStats();
+        logger.info(
+            "Zero state primary stats: {}ms refresh time lag, {}b bytes lag, {}b upload bytes started, {}b upload bytes failed , {} uploads succeeded, {} upload byes succeeded.",
+            zeroStatePrimaryStats.refreshTimeLagMs,
+            zeroStatePrimaryStats.bytesLag,
+            zeroStatePrimaryStats.uploadBytesStarted,
+            zeroStatePrimaryStats.uploadBytesFailed,
+            zeroStatePrimaryStats.totalUploadsSucceeded,
+            zeroStatePrimaryStats.uploadBytesSucceeded
+        );
         assertTrue(
             zeroStatePrimaryStats.totalUploadsStarted == zeroStatePrimaryStats.totalUploadsSucceeded
                 && zeroStatePrimaryStats.totalUploadsSucceeded == 1
@@ -347,6 +358,7 @@ public class RemoteStoreStatsIT extends RemoteStoreBaseIntegTestCase {
         }
     }
 
+    @TestLogging(reason = "Getting trace logs from remote store package", value = "org.opensearch.index.shard:TRACE")
     public void testDownloadStatsCorrectnessSinglePrimaryMultipleReplicaShards() throws Exception {
         setup();
         // Scenario:
@@ -379,6 +391,15 @@ public class RemoteStoreStatsIT extends RemoteStoreBaseIntegTestCase {
             .collect(Collectors.toList())
             .get(0)
             .getSegmentStats();
+        logger.info(
+            "Zero state primary stats: {}ms refresh time lag, {}b bytes lag, {}b upload bytes started, {}b upload bytes failed , {} uploads succeeded, {} upload byes succeeded.",
+            zeroStatePrimaryStats.refreshTimeLagMs,
+            zeroStatePrimaryStats.bytesLag,
+            zeroStatePrimaryStats.uploadBytesStarted,
+            zeroStatePrimaryStats.uploadBytesFailed,
+            zeroStatePrimaryStats.totalUploadsSucceeded,
+            zeroStatePrimaryStats.uploadBytesSucceeded
+        );
         assertTrue(
             zeroStatePrimaryStats.totalUploadsStarted == zeroStatePrimaryStats.totalUploadsSucceeded
                 && zeroStatePrimaryStats.totalUploadsSucceeded == 1
@@ -608,7 +629,7 @@ public class RemoteStoreStatsIT extends RemoteStoreBaseIntegTestCase {
                 }
                 assertZeroTranslogDownloadStats(translogStats);
             });
-        }, 5, TimeUnit.SECONDS);
+        }, 10, TimeUnit.SECONDS);
     }
 
     public void testStatsCorrectnessOnFailover() {

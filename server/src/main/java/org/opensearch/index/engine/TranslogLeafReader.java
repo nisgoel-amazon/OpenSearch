@@ -90,6 +90,7 @@ public final class TranslogLeafReader extends LeafReader {
         0,
         VectorEncoding.FLOAT32,
         VectorSimilarityFunction.EUCLIDEAN,
+        false,
         false
     );
     private static final FieldInfo FAKE_ROUTING_FIELD = new FieldInfo(
@@ -108,6 +109,7 @@ public final class TranslogLeafReader extends LeafReader {
         0,
         VectorEncoding.FLOAT32,
         VectorSimilarityFunction.EUCLIDEAN,
+        false,
         false
     );
     private static final FieldInfo FAKE_ID_FIELD = new FieldInfo(
@@ -126,6 +128,7 @@ public final class TranslogLeafReader extends LeafReader {
         0,
         VectorEncoding.FLOAT32,
         VectorSimilarityFunction.EUCLIDEAN,
+        false,
         false
     );
     public static Set<String> ALL_FIELD_NAMES = Sets.newHashSet(FAKE_SOURCE_FIELD.name, FAKE_ROUTING_FIELD.name, FAKE_ID_FIELD.name);
@@ -261,13 +264,13 @@ public final class TranslogLeafReader extends LeafReader {
     }
 
     @Override
-    public FloatVectorValues getFloatVectorValues(String field) throws IOException {
-        return getFloatVectorValues(field);
+    public FloatVectorValues getFloatVectorValues(String field) {
+        throw new UnsupportedOperationException();
     }
 
     @Override
-    public ByteVectorValues getByteVectorValues(String field) throws IOException {
-        return getByteVectorValues(field);
+    public ByteVectorValues getByteVectorValues(String field) {
+        throw new UnsupportedOperationException();
     }
 
     @Override

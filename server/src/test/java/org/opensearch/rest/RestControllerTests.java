@@ -60,6 +60,7 @@ import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpNodeClient;
 import org.opensearch.test.rest.FakeRestRequest;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.usage.UsageService;
 import org.junit.After;
 import org.junit.Before;
@@ -113,7 +114,7 @@ public class RestControllerTests extends OpenSearchTestCase {
         // we can do this here only because we know that we don't adjust breaker settings dynamically in the test
         inFlightRequestsBreaker = circuitBreakerService.getBreaker(CircuitBreaker.IN_FLIGHT_REQUESTS);
 
-        identityService = new IdentityService(Settings.EMPTY, List.of());
+        identityService = new IdentityService(Settings.EMPTY, mock(ThreadPool.class), List.of());
 
         HttpServerTransport httpServerTransport = new TestHttpServerTransport();
         client = new NoOpNodeClient(this.getTestName());
@@ -137,6 +138,37 @@ public class RestControllerTests extends OpenSearchTestCase {
         IOUtils.close(client);
     }
 
+    public void testDefaultRestControllerGetAllHandlersContainsFavicon() {
+        final RestController restController = new RestController(null, null, null, circuitBreakerService, usageService, identityService);
+        Iterator<MethodHandlers> handlers = restController.getAllHandlers();
+        assertTrue(handlers.hasNext());
+        MethodHandlers faviconHandler = handlers.next();
+        assertEquals(faviconHandler.getPath(), "/favicon.ico");
+        assertEquals(faviconHandler.getValidMethods(), Set.of(RestRequest.Method.GET));
+        assertFalse(handlers.hasNext());
+    }
+
+    public void testRestControllerGetAllHandlers() {
+        final RestController restController = new RestController(null, null, null, circuitBreakerService, usageService, identityService);
+
+        restController.registerHandler(RestRequest.Method.PATCH, "/foo", mock(RestHandler.class));
+        restController.registerHandler(RestRequest.Method.GET, "/foo", mock(RestHandler.class));
+
+        Iterator<MethodHandlers> handlers = restController.getAllHandlers();
+
+        assertTrue(handlers.hasNext());
+        MethodHandlers rootHandler = handlers.next();
+        assertEquals(rootHandler.getPath(), "/foo");
+        assertEquals(rootHandler.getValidMethods(), Set.of(RestRequest.Method.GET, RestRequest.Method.PATCH));
+
+        assertTrue(handlers.hasNext());
+        MethodHandlers faviconHandler = handlers.next();
+        assertEquals(faviconHandler.getPath(), "/favicon.ico");
+        assertEquals(faviconHandler.getValidMethods(), Set.of(RestRequest.Method.GET));
+
+        assertFalse(handlers.hasNext());
+    }
+
     public void testApplyRelevantHeaders() throws Exception {
         final ThreadContext threadContext = client.threadPool().getThreadContext();
         Set<RestHeaderDefinition> headers = new HashSet<>(
@@ -149,15 +181,15 @@ public class RestControllerTests extends OpenSearchTestCase {
         restHeaders.put("header.3", Collections.singletonList("false"));
         RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withHeaders(restHeaders).build();
         final RestController spyRestController = spy(restController);
-        when(spyRestController.getAllHandlers(null, fakeRequest.rawPath())).thenReturn(new Iterator<MethodHandlers>() {
+        when(spyRestController.getAllRestMethodHandlers(null, fakeRequest.rawPath())).thenReturn(new Iterator<RestMethodHandlers>() {
             @Override
             public boolean hasNext() {
                 return false;
             }
 
             @Override
-            public MethodHandlers next() {
-                return new MethodHandlers("/", (RestRequest request, RestChannel channel, NodeClient client) -> {
+            public RestMethodHandlers next() {
+                return new RestMethodHandlers("/", (RestRequest request, RestChannel channel, NodeClient client) -> {
                     assertEquals("true", threadContext.getHeader("header.1"));
                     assertEquals("true", threadContext.getHeader("header.2"));
                     assertNull(threadContext.getHeader("header.3"));

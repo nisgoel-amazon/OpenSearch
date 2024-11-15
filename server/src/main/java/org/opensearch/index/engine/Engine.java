@@ -1373,6 +1373,7 @@ public abstract class Engine implements Closeable {
                     // clean all unreferenced files on best effort basis created during failed merge and reset the
                     // shard state back to last Lucene Commit.
                     if (shouldCleanupUnreferencedFiles() && isMergeFailureDueToIOException(failure, reason)) {
+                        logger.info("Cleaning up unreferenced files as merge failed due to: {}", reason);
                         cleanUpUnreferencedFiles();
                     }
 
@@ -2177,8 +2178,9 @@ public abstract class Engine implements Closeable {
     /**
      * The runner for translog recovery
      *
-     * @opensearch.internal
+     * @opensearch.api
      */
+    @PublicApi(since = "1.0.0")
     @FunctionalInterface
     public interface TranslogRecoveryRunner {
         int run(Engine engine, Translog.Snapshot snapshot) throws IOException;

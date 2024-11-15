@@ -41,7 +41,6 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.SizeValue;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.common.util.concurrent.OpenSearchThreadPoolExecutor;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -105,6 +104,7 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         public static final String REFRESH = "refresh";
         public static final String WARMER = "warmer";
         public static final String SNAPSHOT = "snapshot";
+        public static final String SNAPSHOT_DELETION = "snapshot_deletion";
         public static final String FORCE_MERGE = "force_merge";
         public static final String FETCH_SHARD_STARTED = "fetch_shard_started";
         public static final String FETCH_SHARD_STORE = "fetch_shard_store";
@@ -115,6 +115,7 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         public static final String REMOTE_PURGE = "remote_purge";
         public static final String REMOTE_REFRESH_RETRY = "remote_refresh_retry";
         public static final String REMOTE_RECOVERY = "remote_recovery";
+        public static final String REMOTE_STATE_READ = "remote_state_read";
         public static final String INDEX_SEARCHER = "index_searcher";
     }
 
@@ -175,6 +176,7 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         map.put(Names.REFRESH, ThreadPoolType.SCALING);
         map.put(Names.WARMER, ThreadPoolType.SCALING);
         map.put(Names.SNAPSHOT, ThreadPoolType.SCALING);
+        map.put(Names.SNAPSHOT_DELETION, ThreadPoolType.SCALING);
         map.put(Names.FORCE_MERGE, ThreadPoolType.FIXED);
         map.put(Names.FETCH_SHARD_STARTED, ThreadPoolType.SCALING);
         map.put(Names.FETCH_SHARD_STORE, ThreadPoolType.SCALING);
@@ -186,9 +188,8 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         map.put(Names.REMOTE_PURGE, ThreadPoolType.SCALING);
         map.put(Names.REMOTE_REFRESH_RETRY, ThreadPoolType.SCALING);
         map.put(Names.REMOTE_RECOVERY, ThreadPoolType.SCALING);
-        if (FeatureFlags.isEnabled(FeatureFlags.CONCURRENT_SEGMENT_SEARCH)) {
-            map.put(Names.INDEX_SEARCHER, ThreadPoolType.FIXED_AUTO_QUEUE_SIZE);
-        }
+        map.put(Names.INDEX_SEARCHER, ThreadPoolType.FIXED_AUTO_QUEUE_SIZE);
+        map.put(Names.REMOTE_STATE_READ, ThreadPoolType.SCALING);
         THREAD_POOL_TYPES = Collections.unmodifiableMap(map);
     }
 
@@ -230,9 +231,11 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
 
         final Map<String, ExecutorBuilder> builders = new HashMap<>();
         final int allocatedProcessors = OpenSearchExecutors.allocatedProcessors(settings);
+        final int halfProc = halfAllocatedProcessors(allocatedProcessors);
         final int halfProcMaxAt5 = halfAllocatedProcessorsMaxFive(allocatedProcessors);
         final int halfProcMaxAt10 = halfAllocatedProcessorsMaxTen(allocatedProcessors);
         final int genericThreadPoolMax = boundedBy(4 * allocatedProcessors, 128, 512);
+        final int snapshotDeletionPoolMax = boundedBy(4 * allocatedProcessors, 64, 256);
         builders.put(Names.GENERIC, new ScalingExecutorBuilder(Names.GENERIC, 4, genericThreadPoolMax, TimeValue.timeValueSeconds(30)));
         builders.put(Names.WRITE, new FixedExecutorBuilder(settings, Names.WRITE, allocatedProcessors, 10000));
         builders.put(Names.GET, new FixedExecutorBuilder(settings, Names.GET, allocatedProcessors, 1000));
@@ -263,6 +266,10 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         builders.put(Names.WARMER, new ScalingExecutorBuilder(Names.WARMER, 1, halfProcMaxAt5, TimeValue.timeValueMinutes(5)));
         builders.put(Names.SNAPSHOT, new ScalingExecutorBuilder(Names.SNAPSHOT, 1, halfProcMaxAt5, TimeValue.timeValueMinutes(5)));
         builders.put(
+            Names.SNAPSHOT_DELETION,
+            new ScalingExecutorBuilder(Names.SNAPSHOT_DELETION, 1, snapshotDeletionPoolMax, TimeValue.timeValueMinutes(5))
+        );
+        builders.put(
             Names.FETCH_SHARD_STARTED,
             new ScalingExecutorBuilder(Names.FETCH_SHARD_STARTED, 1, 2 * allocatedProcessors, TimeValue.timeValueMinutes(5))
         );
@@ -275,13 +282,13 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
         builders.put(Names.SYSTEM_WRITE, new FixedExecutorBuilder(settings, Names.SYSTEM_WRITE, halfProcMaxAt5, 1000, false));
         builders.put(
             Names.TRANSLOG_TRANSFER,
-            new ScalingExecutorBuilder(Names.TRANSLOG_TRANSFER, 1, halfProcMaxAt10, TimeValue.timeValueMinutes(5))
+            new ScalingExecutorBuilder(Names.TRANSLOG_TRANSFER, 1, halfProc, TimeValue.timeValueMinutes(5))
         );
         builders.put(Names.TRANSLOG_SYNC, new FixedExecutorBuilder(settings, Names.TRANSLOG_SYNC, allocatedProcessors * 4, 10000));
-        builders.put(Names.REMOTE_PURGE, new ScalingExecutorBuilder(Names.REMOTE_PURGE, 1, halfProcMaxAt5, TimeValue.timeValueMinutes(5)));
+        builders.put(Names.REMOTE_PURGE, new ScalingExecutorBuilder(Names.REMOTE_PURGE, 1, halfProc, TimeValue.timeValueMinutes(5)));
         builders.put(
             Names.REMOTE_REFRESH_RETRY,
-            new ScalingExecutorBuilder(Names.REMOTE_REFRESH_RETRY, 1, halfProcMaxAt10, TimeValue.timeValueMinutes(5))
+            new ScalingExecutorBuilder(Names.REMOTE_REFRESH_RETRY, 1, halfProc, TimeValue.timeValueMinutes(5))
         );
         builders.put(
             Names.REMOTE_RECOVERY,
@@ -292,21 +299,28 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
                 TimeValue.timeValueMinutes(5)
             )
         );
-        if (FeatureFlags.isEnabled(FeatureFlags.CONCURRENT_SEGMENT_SEARCH)) {
-            builders.put(
+        builders.put(
+            Names.REMOTE_STATE_READ,
+            new ScalingExecutorBuilder(
+                Names.REMOTE_STATE_READ,
+                1,
+                twiceAllocatedProcessors(allocatedProcessors),
+                TimeValue.timeValueMinutes(5)
+            )
+        );
+        builders.put(
+            Names.INDEX_SEARCHER,
+            new AutoQueueAdjustingExecutorBuilder(
+                settings,
                 Names.INDEX_SEARCHER,
-                new AutoQueueAdjustingExecutorBuilder(
-                    settings,
-                    Names.INDEX_SEARCHER,
-                    allocatedProcessors,
-                    1000,
-                    1000,
-                    1000,
-                    2000,
-                    runnableTaskListener
-                )
-            );
-        }
+                twiceAllocatedProcessors(allocatedProcessors),
+                1000,
+                1000,
+                1000,
+                2000,
+                runnableTaskListener
+            )
+        );
 
         for (final ExecutorBuilder<?> builder : customBuilders) {
             if (builders.containsKey(builder.name())) {
@@ -573,6 +587,10 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler {
      */
     static int boundedBy(int value, int min, int max) {
         return Math.min(max, Math.max(min, value));
+    }
+
+    static int halfAllocatedProcessors(int allocatedProcessors) {
+        return (allocatedProcessors + 1) / 2;
     }
 
     static int halfAllocatedProcessorsMaxFive(final int allocatedProcessors) {

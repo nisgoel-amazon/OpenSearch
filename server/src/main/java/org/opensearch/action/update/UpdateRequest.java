@@ -43,6 +43,7 @@ import org.opensearch.action.support.WriteRequest;
 import org.opensearch.action.support.replication.ReplicationRequest;
 import org.opensearch.action.support.single.instance.InstanceShardOperationRequest;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.xcontent.LoggingDeprecationHandler;
 import org.opensearch.common.xcontent.XContentHelper;
@@ -75,8 +76,9 @@ import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
 /**
  * Transport request for updating an index
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class UpdateRequest extends InstanceShardOperationRequest<UpdateRequest>
     implements
         DocWriteRequest<UpdateRequest>,
@@ -612,7 +614,7 @@ public class UpdateRequest extends InstanceShardOperationRequest<UpdateRequest>
 
     /**
      * If set, only perform this update request if the document was last modification was assigned this primary term.
-     *
+     * <p>
      * If the document last modification was assigned a different term a
      * {@link org.opensearch.index.engine.VersionConflictEngineException} will be thrown.
      */
@@ -738,7 +740,7 @@ public class UpdateRequest extends InstanceShardOperationRequest<UpdateRequest>
 
     private IndexRequest safeDoc() {
         if (doc == null) {
-            doc = new IndexRequest();
+            doc = new IndexRequest(index);
         }
         return doc;
     }
@@ -824,7 +826,7 @@ public class UpdateRequest extends InstanceShardOperationRequest<UpdateRequest>
 
     private IndexRequest safeUpsertRequest() {
         if (upsertRequest == null) {
-            upsertRequest = new IndexRequest();
+            upsertRequest = new IndexRequest(index);
         }
         return upsertRequest;
     }

@@ -32,8 +32,10 @@
 
 package org.opensearch.action.admin.cluster.snapshots.status;
 
+import org.opensearch.Version;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -45,13 +47,15 @@ import static org.opensearch.action.ValidateActions.addValidationError;
 /**
  * Get snapshot status request
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class SnapshotsStatusRequest extends ClusterManagerNodeRequest<SnapshotsStatusRequest> {
 
     private String repository = "_all";
 
     private String[] snapshots = Strings.EMPTY_ARRAY;
+    private String[] indices = Strings.EMPTY_ARRAY;
 
     private boolean ignoreUnavailable;
 
@@ -68,11 +72,27 @@ public class SnapshotsStatusRequest extends ClusterManagerNodeRequest<SnapshotsS
         this.snapshots = snapshots;
     }
 
+    /**
+     * Constructs a new get snapshots request with given repository name and list of snapshots
+     *
+     * @param repository repository name
+     * @param snapshots  list of snapshots
+     * @param indices  list of indices
+     */
+    public SnapshotsStatusRequest(String repository, String[] snapshots, String[] indices) {
+        this.repository = repository;
+        this.snapshots = snapshots;
+        this.indices = indices;
+    }
+
     public SnapshotsStatusRequest(StreamInput in) throws IOException {
         super(in);
         repository = in.readString();
         snapshots = in.readStringArray();
         ignoreUnavailable = in.readBoolean();
+        if (in.getVersion().onOrAfter(Version.V_2_17_0)) {
+            indices = in.readOptionalStringArray();
+        }
     }
 
     @Override
@@ -81,6 +101,9 @@ public class SnapshotsStatusRequest extends ClusterManagerNodeRequest<SnapshotsS
         out.writeString(repository);
         out.writeStringArray(snapshots);
         out.writeBoolean(ignoreUnavailable);
+        if (out.getVersion().onOrAfter(Version.V_2_17_0)) {
+            out.writeOptionalStringArray(indices);
+        }
     }
 
     /**
@@ -100,6 +123,9 @@ public class SnapshotsStatusRequest extends ClusterManagerNodeRequest<SnapshotsS
         }
         if (snapshots == null) {
             validationException = addValidationError("snapshots is null", validationException);
+        }
+        if (indices.length != 0 && snapshots.length != 1) {
+            validationException = addValidationError("index list filter is supported only for a single snapshot", validationException);
         }
         return validationException;
     }
@@ -144,10 +170,29 @@ public class SnapshotsStatusRequest extends ClusterManagerNodeRequest<SnapshotsS
     }
 
     /**
-     * Set to <code>true</code> to ignore unavailable snapshots, instead of throwing an exception.
-     * Defaults to <code>false</code>, which means unavailable snapshots cause an exception to be thrown.
+     * Returns the names of the indices.
      *
-     * @param ignoreUnavailable whether to ignore unavailable snapshots
+     * @return the names of indices
+     */
+    public String[] indices() {
+        return this.indices;
+    }
+
+    /**
+     * Sets the list of indices to be returned
+     *
+     * @return this request
+     */
+    public SnapshotsStatusRequest indices(String[] indices) {
+        this.indices = indices;
+        return this;
+    }
+
+    /**
+     * Set to <code>true</code> to ignore unavailable snapshots and indices, instead of throwing an exception.
+     * Defaults to <code>false</code>, which means unavailable snapshots and indices cause an exception to be thrown.
+     *
+     * @param ignoreUnavailable whether to ignore unavailable snapshots and indices
      * @return this request
      */
     public SnapshotsStatusRequest ignoreUnavailable(boolean ignoreUnavailable) {
@@ -156,9 +201,9 @@ public class SnapshotsStatusRequest extends ClusterManagerNodeRequest<SnapshotsS
     }
 
     /**
-     * Returns whether the request permits unavailable snapshots to be ignored.
+     * Returns whether the request permits unavailable snapshots and indices to be ignored.
      *
-     * @return true if the request will ignore unavailable snapshots, false if it will throw an exception on unavailable snapshots
+     * @return true if the request will ignore unavailable snapshots and indices, false if it will throw an exception on unavailable snapshots and indices
      */
     public boolean ignoreUnavailable() {
         return ignoreUnavailable;

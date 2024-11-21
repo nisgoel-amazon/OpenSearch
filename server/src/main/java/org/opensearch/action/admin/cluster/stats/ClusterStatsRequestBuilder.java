@@ -34,12 +34,14 @@ package org.opensearch.action.admin.cluster.stats;
 
 import org.opensearch.action.support.nodes.NodesOperationRequestBuilder;
 import org.opensearch.client.OpenSearchClient;
+import org.opensearch.common.annotation.PublicApi;
 
 /**
  * Transport request builder for obtaining cluster stats
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class ClusterStatsRequestBuilder extends NodesOperationRequestBuilder<
     ClusterStatsRequest,
     ClusterStatsResponse,
@@ -47,5 +49,10 @@ public class ClusterStatsRequestBuilder extends NodesOperationRequestBuilder<
 
     public ClusterStatsRequestBuilder(OpenSearchClient client, ClusterStatsAction action) {
         super(client, action, new ClusterStatsRequest());
+    }
+
+    public final ClusterStatsRequestBuilder useAggregatedNodeLevelResponses(boolean useAggregatedNodeLevelResponses) {
+        request.useAggregatedNodeLevelResponses(useAggregatedNodeLevelResponses);
+        return this;
     }
 }

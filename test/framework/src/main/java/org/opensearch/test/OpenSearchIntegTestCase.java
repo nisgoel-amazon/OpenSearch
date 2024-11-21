@@ -32,13 +32,12 @@
 
 package org.opensearch.test;
 
-import com.carrotsearch.randomizedtesting.RandomizedContext;
 import com.carrotsearch.randomizedtesting.annotations.TestGroup;
 import com.carrotsearch.randomizedtesting.generators.RandomNumbers;
 import com.carrotsearch.randomizedtesting.generators.RandomPicks;
 
-import org.apache.http.HttpHost;
 import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.tests.util.LuceneTestCase;
@@ -48,8 +47,8 @@ import org.opensearch.action.DocWriteResponse;
 import org.opensearch.action.admin.cluster.health.ClusterHealthRequest;
 import org.opensearch.action.admin.cluster.health.ClusterHealthResponse;
 import org.opensearch.action.admin.cluster.node.hotthreads.NodeHotThreads;
-import org.opensearch.action.admin.cluster.node.info.NodeInfo;
 import org.opensearch.action.admin.cluster.node.info.NodesInfoResponse;
+import org.opensearch.action.admin.cluster.repositories.put.PutRepositoryRequestBuilder;
 import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest;
 import org.opensearch.action.admin.cluster.state.ClusterStateResponse;
 import org.opensearch.action.admin.cluster.tasks.PendingClusterTasksResponse;
@@ -71,12 +70,13 @@ import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.search.ClearScrollResponse;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.IndicesOptions;
+import org.opensearch.action.support.WriteRequest;
+import org.opensearch.action.support.master.AcknowledgedResponse;
 import org.opensearch.client.AdminClient;
 import org.opensearch.client.Client;
 import org.opensearch.client.ClusterAdminClient;
 import org.opensearch.client.Requests;
 import org.opensearch.client.RestClient;
-import org.opensearch.client.RestClientBuilder;
 import org.opensearch.cluster.ClusterModule;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.RestoreInProgress;
@@ -84,6 +84,7 @@ import org.opensearch.cluster.SnapshotDeletionsInProgress;
 import org.opensearch.cluster.SnapshotsInProgress;
 import org.opensearch.cluster.coordination.OpenSearchNodeCommand;
 import org.opensearch.cluster.health.ClusterHealthStatus;
+import org.opensearch.cluster.metadata.Context;
 import org.opensearch.cluster.metadata.IndexGraveyard;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
@@ -97,12 +98,15 @@ import org.opensearch.cluster.routing.allocation.DiskThresholdSettings;
 import org.opensearch.cluster.routing.allocation.decider.AwarenessAllocationDecider;
 import org.opensearch.cluster.routing.allocation.decider.EnableAllocationDecider;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.cluster.service.applicationtemplates.TestSystemTemplatesRepositoryPlugin;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.Priority;
+import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.collect.Tuple;
-import org.opensearch.common.network.NetworkAddress;
+import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.network.NetworkModule;
 import org.opensearch.common.regex.Regex;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.FeatureFlagSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Setting.Property;
@@ -110,7 +114,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.util.concurrent.ThreadContext;
-import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.common.xcontent.smile.SmileXContent;
@@ -124,6 +127,7 @@ import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -132,8 +136,8 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.env.Environment;
 import org.opensearch.env.TestEnvironment;
-import org.opensearch.http.HttpInfo;
 import org.opensearch.index.IndexModule;
+import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.MergeSchedulerConfig;
 import org.opensearch.index.MockEngineFactoryPlugin;
@@ -142,21 +146,31 @@ import org.opensearch.index.codec.CodecService;
 import org.opensearch.index.engine.Segment;
 import org.opensearch.index.mapper.CompletionFieldMapper;
 import org.opensearch.index.mapper.MockFieldFilterPlugin;
+import org.opensearch.index.remote.RemoteStoreEnums;
+import org.opensearch.index.remote.RemoteStoreEnums.PathType;
+import org.opensearch.index.remote.RemoteStorePathStrategy;
+import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.IndicesQueryCache;
 import org.opensearch.indices.IndicesRequestCache;
+import org.opensearch.indices.IndicesService;
+import org.opensearch.indices.RemoteStoreSettings;
+import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.indices.store.IndicesStore;
 import org.opensearch.ingest.IngestMetadata;
 import org.opensearch.monitor.os.OsInfo;
 import org.opensearch.node.NodeMocksPlugin;
+import org.opensearch.node.remotestore.RemoteStoreNodeService;
 import org.opensearch.plugins.NetworkPlugin;
 import org.opensearch.plugins.Plugin;
-import org.opensearch.rest.action.RestCancellableNodeClient;
+import org.opensearch.repositories.IndexId;
+import org.opensearch.repositories.blobstore.BlobStoreRepository;
+import org.opensearch.repositories.fs.FsRepository;
+import org.opensearch.repositories.fs.ReloadableFsRepository;
 import org.opensearch.script.MockScriptService;
 import org.opensearch.script.ScriptMetadata;
 import org.opensearch.search.MockSearchService;
-import org.opensearch.search.SearchBootstrapSettings;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchService;
 import org.opensearch.telemetry.TelemetrySettings;
@@ -165,17 +179,15 @@ import org.opensearch.test.disruption.NetworkDisruption;
 import org.opensearch.test.disruption.ServiceDisruptionScheme;
 import org.opensearch.test.store.MockFSIndexStore;
 import org.opensearch.test.telemetry.MockTelemetryPlugin;
-import org.opensearch.test.telemetry.tracing.StrictCheckSpanProcessor;
 import org.opensearch.test.transport.MockTransportService;
 import org.opensearch.transport.TransportInterceptor;
 import org.opensearch.transport.TransportRequest;
 import org.opensearch.transport.TransportRequestHandler;
 import org.opensearch.transport.TransportService;
 import org.hamcrest.Matchers;
-import org.junit.After;
 import org.junit.AfterClass;
-import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 
 import java.io.IOException;
 import java.lang.Runtime.Version;
@@ -196,13 +208,12 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -216,14 +227,25 @@ import static org.opensearch.common.unit.TimeValue.timeValueMillis;
 import static org.opensearch.core.common.util.CollectionUtils.eagerPartition;
 import static org.opensearch.discovery.DiscoveryModule.DISCOVERY_SEED_PROVIDERS_SETTING;
 import static org.opensearch.discovery.SettingsBasedSeedHostsProvider.DISCOVERY_SEED_HOSTS_SETTING;
+import static org.opensearch.index.IndexSettings.INDEX_DOC_ID_FUZZY_SET_ENABLED_SETTING;
+import static org.opensearch.index.IndexSettings.INDEX_DOC_ID_FUZZY_SET_FALSE_POSITIVE_PROBABILITY_SETTING;
 import static org.opensearch.index.IndexSettings.INDEX_SOFT_DELETES_RETENTION_LEASE_PERIOD_SETTING;
 import static org.opensearch.index.query.QueryBuilders.matchAllQuery;
+import static org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
+import static org.opensearch.indices.IndicesService.CLUSTER_REPLICATION_TYPE_SETTING;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY;
+import static org.opensearch.node.remotestore.RemoteStoreNodeService.MIGRATION_DIRECTION_SETTING;
+import static org.opensearch.node.remotestore.RemoteStoreNodeService.REMOTE_STORE_COMPATIBILITY_MODE_SETTING;
 import static org.opensearch.test.XContentTestUtils.convertToMap;
 import static org.opensearch.test.XContentTestUtils.differenceBetweenMapsIgnoringArrayOrder;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertNoFailures;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertNoTimeout;
-import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.emptyIterable;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
@@ -330,6 +352,10 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
     public static final String TESTS_ENABLE_MOCK_MODULES = "tests.enable_mock_modules";
 
     private static final boolean MOCK_MODULES_ENABLED = "true".equals(System.getProperty(TESTS_ENABLE_MOCK_MODULES, "true"));
+
+    @Rule
+    public static OpenSearchTestClusterRule testClusterRule = new OpenSearchTestClusterRule();
+
     /**
      * Threshold at which indexing switches from frequently async to frequently bulk.
      */
@@ -366,18 +392,6 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
     public static final String TESTS_CLUSTER_NAME = "tests.clustername";
 
     /**
-     * The current cluster depending on the configured {@link Scope}.
-     * By default if no {@link ClusterScope} is configured this will hold a reference to the suite cluster.
-     */
-    private static TestCluster currentCluster;
-    private static RestClient restClient = null;
-
-    private static final Map<Class<?>, TestCluster> clusters = new IdentityHashMap<>();
-
-    private static OpenSearchIntegTestCase INSTANCE = null; // see @SuiteScope
-    private static Long SUITE_SEED = null;
-
-    /**
      * The lucene_default {@link Codec} is not added to the list as it internally maps to Asserting {@link Codec}.
      * The override to fetch the {@link CompletionFieldMapper.CompletionFieldType} postings format is not available for this codec.
      */
@@ -388,10 +402,21 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         CodecService.ZLIB
     );
 
+    private static Boolean prefixModeVerificationEnable;
+
+    private static Boolean translogPathFixedPrefix;
+
+    private static Boolean segmentsPathFixedPrefix;
+
+    private static Boolean snapshotShardPathFixedPrefix;
+
     @BeforeClass
     public static void beforeClass() throws Exception {
-        SUITE_SEED = randomLong();
-        initializeSuiteScope();
+        prefixModeVerificationEnable = randomBoolean();
+        translogPathFixedPrefix = randomBoolean();
+        segmentsPathFixedPrefix = randomBoolean();
+        snapshotShardPathFixedPrefix = randomBoolean();
+        testClusterRule.beforeClass();
     }
 
     @Override
@@ -399,36 +424,6 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         // In an integ test it doesn't make sense to keep track of warnings: if the cluster is external the warnings are in another jvm,
         // if the cluster is internal the deprecation logger is shared across all nodes
         return false;
-    }
-
-    protected final void beforeInternal() throws Exception {
-        final Scope currentClusterScope = getCurrentClusterScope();
-        Callable<Void> setup = () -> {
-            cluster().beforeTest(random());
-            cluster().wipe(excludeTemplates());
-            randomIndexTemplate();
-            return null;
-        };
-        switch (currentClusterScope) {
-            case SUITE:
-                assert SUITE_SEED != null : "Suite seed was not initialized";
-                currentCluster = buildAndPutCluster(currentClusterScope, SUITE_SEED);
-                RandomizedContext.current().runWithPrivateRandomness(SUITE_SEED, setup);
-                break;
-            case TEST:
-                currentCluster = buildAndPutCluster(currentClusterScope, randomLong());
-                setup.call();
-                break;
-        }
-
-    }
-
-    private void printTestMessage(String message) {
-        if (isSuiteScopedTest(getClass()) && (getTestName().equals("<unknown>"))) {
-            logger.info("[{}]: {} suite", getTestClass().getSimpleName(), message);
-        } else {
-            logger.info("[{}#{}]: {} test", getTestClass().getSimpleName(), getTestName(), message);
-        }
     }
 
     /**
@@ -554,85 +549,6 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return builder;
     }
 
-    private TestCluster buildWithPrivateContext(final Scope scope, final long seed) throws Exception {
-        return RandomizedContext.current().runWithPrivateRandomness(seed, () -> buildTestCluster(scope, seed));
-    }
-
-    private TestCluster buildAndPutCluster(Scope currentClusterScope, long seed) throws Exception {
-        final Class<?> clazz = this.getClass();
-        TestCluster testCluster = clusters.remove(clazz); // remove this cluster first
-        clearClusters(); // all leftovers are gone by now... this is really just a double safety if we miss something somewhere
-        switch (currentClusterScope) {
-            case SUITE:
-                if (testCluster == null) { // only build if it's not there yet
-                    testCluster = buildWithPrivateContext(currentClusterScope, seed);
-                }
-                break;
-            case TEST:
-                // close the previous one and create a new one
-                IOUtils.closeWhileHandlingException(testCluster);
-                testCluster = buildTestCluster(currentClusterScope, seed);
-                break;
-        }
-        clusters.put(clazz, testCluster);
-        return testCluster;
-    }
-
-    private static void clearClusters() throws Exception {
-        if (!clusters.isEmpty()) {
-            IOUtils.close(clusters.values());
-            clusters.clear();
-        }
-        if (restClient != null) {
-            restClient.close();
-            restClient = null;
-        }
-        assertBusy(() -> {
-            int numChannels = RestCancellableNodeClient.getNumChannels();
-            assertEquals(
-                numChannels
-                    + " channels still being tracked in "
-                    + RestCancellableNodeClient.class.getSimpleName()
-                    + " while there should be none",
-                0,
-                numChannels
-            );
-        });
-    }
-
-    private void afterInternal(boolean afterClass) throws Exception {
-        final Scope currentClusterScope = getCurrentClusterScope();
-        if (isInternalCluster()) {
-            internalCluster().clearDisruptionScheme();
-        }
-        try {
-            if (cluster() != null) {
-                if (currentClusterScope != Scope.TEST) {
-                    Metadata metadata = client().admin().cluster().prepareState().execute().actionGet().getState().getMetadata();
-
-                    final Set<String> persistentKeys = new HashSet<>(metadata.persistentSettings().keySet());
-                    assertThat("test leaves persistent cluster metadata behind", persistentKeys, empty());
-
-                    final Set<String> transientKeys = new HashSet<>(metadata.transientSettings().keySet());
-                    assertThat("test leaves transient cluster metadata behind", transientKeys, empty());
-                }
-                ensureClusterSizeConsistency();
-                ensureClusterStateConsistency();
-                ensureClusterStateCanBeReadByNodeTool();
-                beforeIndexDeletion();
-                cluster().wipe(excludeTemplates()); // wipe after to make sure we fail in the test that didn't ack the delete
-                if (afterClass || currentClusterScope == Scope.TEST) {
-                    cluster().close();
-                }
-                cluster().assertAfterTest();
-            }
-        } finally {
-            if (currentClusterScope == Scope.TEST) {
-                clearClusters(); // it is ok to leave persistent / transient cluster state behind if scope is TEST
-            }
-        }
-    }
-
     /**
      * @return An exclude set of index templates that will not be removed in between tests.
      */
@@ -645,18 +561,15 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
     }
 
     public static TestCluster cluster() {
-        return currentCluster;
+        return testClusterRule.cluster();
     }
 
     public static boolean isInternalCluster() {
-        return (currentCluster instanceof InternalTestCluster);
+        return testClusterRule.isInternalCluster();
     }
 
     public static InternalTestCluster internalCluster() {
-        if (!isInternalCluster()) {
-            throw new UnsupportedOperationException("current test cluster is immutable");
-        }
-        return (InternalTestCluster) currentCluster;
+        return testClusterRule.internalCluster().orElseThrow(() -> new UnsupportedOperationException("current test cluster is immutable"));
     }
 
     public ClusterService clusterService() {
@@ -668,14 +581,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
     }
 
     public static Client client(@Nullable String node) {
-        if (node != null) {
-            return internalCluster().client(node);
-        }
-        Client client = cluster().client();
-        if (frequently()) {
-            client = new RandomizingClient(client, random());
-        }
-        return client;
+        return testClusterRule.clientForNode(node);
     }
 
     public static Client dataNodeClient() {
@@ -778,6 +684,11 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             );
         }
 
+        if (randomBoolean()) {
+            builder.put(INDEX_DOC_ID_FUZZY_SET_ENABLED_SETTING.getKey(), true);
+            builder.put(INDEX_DOC_ID_FUZZY_SET_FALSE_POSITIVE_PROBABILITY_SETTING.getKey(), randomDoubleBetween(0.01, 0.50, true));
+        }
+
         return builder.build();
     }
 
@@ -794,7 +705,33 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         }
         // Enabling Telemetry setting by default
         featureSettings.put(FeatureFlags.TELEMETRY_SETTING.getKey(), true);
+        featureSettings.put(FeatureFlags.APPLICATION_BASED_CONFIGURATION_TEMPLATES_SETTING.getKey(), true);
+
         return featureSettings.build();
+    }
+
+    /**
+     * Represent if it needs to trigger remote state restore or not.
+     * For tests with remote store enabled domain, it will be overridden to true.
+     *
+     * @return if needs to perform remote state restore or not
+     */
+    protected boolean triggerRemoteStateRestore() {
+        return false;
+    }
+
+    /**
+     * For tests with remote cluster state, it will reset the cluster and cluster state will be
+     * restored from remote.
+     */
+    protected void performRemoteStoreTestAction() {
+        if (triggerRemoteStateRestore()) {
+            String clusterUUIDBefore = clusterService().state().metadata().clusterUUID();
+            internalCluster().resetCluster();
+            String clusterUUIDAfter = clusterService().state().metadata().clusterUUID();
+            // assertion that UUID is changed post restore.
+            assertFalse(clusterUUIDBefore.equals(clusterUUIDAfter));
+        }
     }
 
     /**
@@ -823,6 +760,13 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
      */
     public final void createIndex(String name, Settings indexSettings) {
         assertAcked(prepareCreate(name).setSettings(indexSettings));
+    }
+
+    /**
+     * creates an index with the given setting
+     */
+    public final void createIndex(String name, Context context) {
+        assertAcked(prepareCreate(name).setContext(context));
     }
 
     /**
@@ -951,6 +895,10 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return ensureColor(ClusterHealthStatus.GREEN, timeout, false, indices);
     }
 
+    public ClusterHealthStatus ensureGreen(TimeValue timeout, boolean waitForNoRelocatingShards, String... indices) {
+        return ensureColor(ClusterHealthStatus.GREEN, timeout, waitForNoRelocatingShards, false, indices);
+    }
+
     /**
      * Ensures the cluster has a yellow state via the cluster health API.
      */
@@ -979,6 +927,16 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         boolean waitForNoInitializingShards,
         String... indices
     ) {
+        return ensureColor(clusterHealthStatus, timeout, true, waitForNoInitializingShards, indices);
+    }
+
+    private ClusterHealthStatus ensureColor(
+        ClusterHealthStatus clusterHealthStatus,
+        TimeValue timeout,
+        boolean waitForNoRelocatingShards,
+        boolean waitForNoInitializingShards,
+        String... indices
+    ) {
         String color = clusterHealthStatus.name().toLowerCase(Locale.ROOT);
         String method = "ensure" + Strings.capitalize(color);
 
@@ -986,7 +944,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             .timeout(timeout)
             .waitForStatus(clusterHealthStatus)
             .waitForEvents(Priority.LANGUID)
-            .waitForNoRelocatingShards(true)
+            .waitForNoRelocatingShards(waitForNoRelocatingShards)
             .waitForNoInitializingShards(waitForNoInitializingShards)
             // We currently often use ensureGreen or ensureYellow to check whether the cluster is back in a good state after shutting down
             // a node. If the node that is stopped is the cluster-manager node, another node will become cluster-manager and publish a
@@ -1382,7 +1340,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
 
     /**
      * Ensures that all nodes in the cluster are connected to each other.
-     *
+     * <p>
      * Some network disruptions may leave nodes that are not the cluster-manager disconnected from each other.
      * {@link org.opensearch.cluster.NodeConnectionsService} will eventually reconnect but it's
      * handy to be able to ensure this happens faster
@@ -1661,6 +1619,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             for (List<IndexRequestBuilder> segmented : partition) {
                 BulkRequestBuilder bulkBuilder = client().prepareBulk();
                 for (IndexRequestBuilder indexRequestBuilder : segmented) {
+                    indexRequestBuilder.setRefreshPolicy(WriteRequest.RefreshPolicy.NONE);
                     bulkBuilder.add(indexRequestBuilder);
                 }
                 BulkResponse actionGet = bulkBuilder.execute().actionGet();
@@ -1681,6 +1640,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             }
         }
         assertThat(actualErrors, emptyIterable());
+
         if (!bogusIds.isEmpty()) {
             // delete the bogus types again - it might trigger merges or at least holes in the segments and enforces deleted docs!
             for (List<String> doc : bogusIds) {
@@ -1696,6 +1656,66 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
                 client().admin().indices().prepareRefresh(indicesArray).setIndicesOptions(IndicesOptions.lenientExpandOpen()).get()
             );
         }
+        if (dummyDocuments) {
+            indexRandomForMultipleSlices(indicesArray);
+        }
+        if (forceRefresh) {
+            waitForReplication();
+        }
+    }
+
+    /*
+     * This method ingests bogus documents for the given indices such that multiple slices
+     * are formed. This is useful for testing with the concurrent search use-case as it creates
+     * multiple slices based on segment count.
+     * @param indices         the indices in which bogus documents should be ingested
+     * */
+    protected void indexRandomForMultipleSlices(String... indices) throws InterruptedException {
+        Set<List<String>> bogusIds = new HashSet<>();
+        int refreshCount = randomIntBetween(2, 3);
+        for (String index : indices) {
+            int numDocs = getNumShards(index).totalNumShards * randomIntBetween(2, 10);
+            while (refreshCount-- > 0) {
+                final CopyOnWriteArrayList<Tuple<IndexRequestBuilder, Exception>> errors = new CopyOnWriteArrayList<>();
+                List<CountDownLatch> inFlightAsyncOperations = new ArrayList<>();
+                for (int i = 0; i < numDocs; i++) {
+                    String id = "bogus_doc_" + randomRealisticUnicodeOfLength(between(1, 10)) + dummmyDocIdGenerator.incrementAndGet();
+                    IndexRequestBuilder indexRequestBuilder = client().prepareIndex()
+                        .setIndex(index)
+                        .setId(id)
+                        .setSource("{}", MediaTypeRegistry.JSON)
+                        .setRouting(id);
+                    indexRequestBuilder.execute(
+                        new PayloadLatchedActionListener<>(indexRequestBuilder, newLatch(inFlightAsyncOperations), errors)
+                    );
+                    bogusIds.add(Arrays.asList(index, id));
+                }
+                for (CountDownLatch operation : inFlightAsyncOperations) {
+                    operation.await();
+                }
+                final List<Exception> actualErrors = new ArrayList<>();
+                for (Tuple<IndexRequestBuilder, Exception> tuple : errors) {
+                    Throwable t = ExceptionsHelper.unwrapCause(tuple.v2());
+                    if (t instanceof OpenSearchRejectedExecutionException) {
+                        logger.debug("Error indexing doc: " + t.getMessage() + ", reindexing.");
+                        tuple.v1().execute().actionGet(); // re-index if rejected
+                    } else {
+                        actualErrors.add(tuple.v2());
+                    }
+                }
+                assertThat(actualErrors, emptyIterable());
+                refresh(index);
+            }
+        }
+        for (List<String> doc : bogusIds) {
+            assertEquals(
+                "failed to delete a dummy doc [" + doc.get(0) + "][" + doc.get(1) + "]",
+                DocWriteResponse.Result.DELETED,
+                client().prepareDelete(doc.get(0), doc.get(1)).setRouting(doc.get(1)).get().getResult()
+            );
+        }
+        // refresh is called to make sure the bogus docs doesn't affect the search results
+        refresh();
     }
 
     private final AtomicInteger dummmyDocIdGenerator = new AtomicInteger();
@@ -1883,7 +1903,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         assertThat(clearResponse.isSucceeded(), equalTo(true));
     }
 
-    private static <A extends Annotation> A getAnnotation(Class<?> clazz, Class<A> annotationClass) {
+    static <A extends Annotation> A getAnnotation(Class<?> clazz, Class<A> annotationClass) {
         if (clazz == Object.class || clazz == OpenSearchIntegTestCase.class) {
             return null;
         }
@@ -1892,16 +1912,6 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             return annotation;
         }
         return getAnnotation(clazz.getSuperclass(), annotationClass);
-    }
-
-    private Scope getCurrentClusterScope() {
-        return getCurrentClusterScope(this.getClass());
-    }
-
-    private static Scope getCurrentClusterScope(Class<?> clazz) {
-        ClusterScope annotation = getAnnotation(clazz, ClusterScope.class);
-        // if we are not annotated assume suite!
-        return annotation == null ? Scope.SUITE : annotation.scope();
     }
 
     private boolean getSupportsDedicatedClusterManagers() {
@@ -1962,7 +1972,8 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             // randomly enable low-level search cancellation to make sure it does not alter results
             .put(SearchService.LOW_LEVEL_CANCELLATION_SETTING.getKey(), randomBoolean())
             .putList(DISCOVERY_SEED_HOSTS_SETTING.getKey()) // empty list disables a port scan for other nodes
-            .putList(DISCOVERY_SEED_PROVIDERS_SETTING.getKey(), "file");
+            .putList(DISCOVERY_SEED_PROVIDERS_SETTING.getKey(), "file")
+            .put(SearchService.CONCURRENT_SEGMENT_SEARCH_TARGET_MAX_SLICE_COUNT_KEY, 2);
         // add all the featureFlagSettings set by the test
         builder.put(featureFlagSettings);
         if (rarely()) {
@@ -1971,16 +1982,28 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             // fixed thread pool
             builder.put("thread_pool.search.min_queue_size", 100);
         }
-        if (FeatureFlags.CONCURRENT_SEGMENT_SEARCH_SETTING.get(featureFlagSettings)) {
-            // By default, for tests we will put the target slice count of 2. This will increase the probability of having multiple slices
-            // when tests are run with concurrent segment search enabled
-            builder.put(SearchBootstrapSettings.CONCURRENT_SEGMENT_SEARCH_TARGET_MAX_SLICE_COUNT_KEY, 2);
-        }
         // Enable tracer only when Telemetry Setting is enabled
         if (featureFlagSettings().getAsBoolean(FeatureFlags.TELEMETRY_SETTING.getKey(), false)) {
+            builder.put(TelemetrySettings.TRACER_FEATURE_ENABLED_SETTING.getKey(), true);
             builder.put(TelemetrySettings.TRACER_ENABLED_SETTING.getKey(), true);
         }
+
+        // Randomly set a replication strategy for the node. Replication Strategy can still be manually overridden by subclass if needed.
+        if (useRandomReplicationStrategy()) {
+            ReplicationType replicationType = randomBoolean() ? ReplicationType.DOCUMENT : ReplicationType.SEGMENT;
+            logger.info("Randomly using Replication Strategy as {}.", replicationType.toString());
+            builder.put(CLUSTER_REPLICATION_TYPE_SETTING.getKey(), replicationType);
+        }
         return builder.build();
+    }
+
+    /**
+     * Used for selecting random replication strategy, either DOCUMENT or SEGMENT.
+     * This method must be overridden by subclass to use random replication strategy.
+     * Should be used only on test classes where replication strategy is not critical for tests.
+     */
+    protected boolean useRandomReplicationStrategy() {
+        return false;
     }
 
     protected Path nodeConfigPath(int nodeOrdinal) {
@@ -2118,6 +2141,10 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return true;
     }
 
+    protected boolean addMockIndexStorePlugin() {
+        return true;
+    }
+
     /** Returns {@code true} iff this test cluster should use a dummy http transport */
     protected boolean addMockHttpTransport() {
         return true;
@@ -2160,7 +2187,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             if (randomBoolean() && addMockTransportService()) {
                 mocks.add(MockTransportService.TestPlugin.class);
             }
-            if (randomBoolean()) {
+            if (randomBoolean() && addMockIndexStorePlugin()) {
                 mocks.add(MockFSIndexStore.TestPlugin.class);
             }
             if (randomBoolean()) {
@@ -2191,6 +2218,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         if (addMockTelemetryPlugin()) {
             mocks.add(MockTelemetryPlugin.class);
         }
+        mocks.add(TestSystemTemplatesRepositoryPlugin.class);
         return Collections.unmodifiableList(mocks);
     }
 
@@ -2230,10 +2258,9 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
      * Returns path to a random directory that can be used to create a temporary file system repo
      */
     public Path randomRepoPath() {
-        if (currentCluster instanceof InternalTestCluster) {
-            return randomRepoPath(((InternalTestCluster) currentCluster).getDefaultSettings());
-        }
-        throw new UnsupportedOperationException("unsupported cluster type");
+        return testClusterRule.internalCluster()
+            .map(c -> randomRepoPath(c.getDefaultSettings()))
+            .orElseThrow(() -> new UnsupportedOperationException("unsupported cluster type"));
     }
 
     /**
@@ -2307,83 +2334,9 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         }
     }
 
-    private static boolean runTestScopeLifecycle() {
-        return INSTANCE == null;
-    }
-
-    @Before
-    public final void setupTestCluster() throws Exception {
-        if (runTestScopeLifecycle()) {
-            printTestMessage("setting up");
-            beforeInternal();
-            printTestMessage("all set up");
-        }
-    }
-
-    @After
-    public final void cleanUpCluster() throws Exception {
-        // Deleting indices is going to clear search contexts implicitly so we
-        // need to check that there are no more in-flight search contexts before
-        // we remove indices
-        if (isInternalCluster()) {
-            internalCluster().setBootstrapClusterManagerNodeIndex(-1);
-        }
-        super.ensureAllSearchContextsReleased();
-        if (runTestScopeLifecycle()) {
-            printTestMessage("cleaning up after");
-            afterInternal(false);
-            printTestMessage("cleaned up after");
-        }
-    }
-
     @AfterClass
     public static void afterClass() throws Exception {
-        try {
-            if (runTestScopeLifecycle()) {
-                clearClusters();
-            } else {
-                INSTANCE.printTestMessage("cleaning up after");
-                INSTANCE.afterInternal(true);
-                checkStaticState(true);
-            }
-            StrictCheckSpanProcessor.validateTracingStateOnShutdown();
-        } finally {
-            SUITE_SEED = null;
-            currentCluster = null;
-            INSTANCE = null;
-        }
-    }
-
-    private static void initializeSuiteScope() throws Exception {
-        Class<?> targetClass = getTestClass();
-        /**
-         * Note we create these test class instance via reflection
-         * since JUnit creates a new instance per test and that is also
-         * the reason why INSTANCE is static since this entire method
-         * must be executed in a static context.
-         */
-        assert INSTANCE == null;
-        if (isSuiteScopedTest(targetClass)) {
-            // note we need to do this way to make sure this is reproducible
-            if (isSuiteScopedTestParameterized(targetClass)) {
-                INSTANCE = (OpenSearchIntegTestCase) targetClass.getConstructor(Settings.class).newInstance(Settings.EMPTY);
-            } else {
-                INSTANCE = (OpenSearchIntegTestCase) targetClass.getConstructor().newInstance();
-            }
-            boolean success = false;
-            try {
-                INSTANCE.printTestMessage("setup");
-                INSTANCE.beforeInternal();
-                INSTANCE.setupSuiteScopeCluster();
-                success = true;
-            } finally {
-                if (!success) {
-                    afterClass();
-                }
-            }
-        } else {
-            INSTANCE = null;
-        }
+        testClusterRule.afterClass();
     }
 
     /**
@@ -2415,41 +2368,9 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
      * The returned client gets automatically closed when needed, it shouldn't be closed as part of tests otherwise
      * it cannot be reused by other tests anymore.
      */
-    protected static synchronized RestClient getRestClient() {
-        if (restClient == null) {
-            restClient = createRestClient();
-        }
-        return restClient;
-    }
 
-    protected static RestClient createRestClient() {
-        return createRestClient(null, "http");
-    }
-
-    protected static RestClient createRestClient(RestClientBuilder.HttpClientConfigCallback httpClientConfigCallback, String protocol) {
-        NodesInfoResponse nodesInfoResponse = client().admin().cluster().prepareNodesInfo().get();
-        assertFalse(nodesInfoResponse.hasFailures());
-        return createRestClient(nodesInfoResponse.getNodes(), httpClientConfigCallback, protocol);
-    }
-
-    protected static RestClient createRestClient(
-        final List<NodeInfo> nodes,
-        RestClientBuilder.HttpClientConfigCallback httpClientConfigCallback,
-        String protocol
-    ) {
-        List<HttpHost> hosts = new ArrayList<>();
-        for (NodeInfo node : nodes) {
-            if (node.getInfo(HttpInfo.class) != null) {
-                TransportAddress publishAddress = node.getInfo(HttpInfo.class).address().publishAddress();
-                InetSocketAddress address = publishAddress.address();
-                hosts.add(new HttpHost(NetworkAddress.format(address.getAddress()), address.getPort(), protocol));
-            }
-        }
-        RestClientBuilder builder = RestClient.builder(hosts.toArray(new HttpHost[hosts.size()]));
-        if (httpClientConfigCallback != null) {
-            builder.setHttpClientConfigCallback(httpClientConfigCallback);
-        }
-        return builder.build();
+    protected static RestClient getRestClient() {
+        return testClusterRule.getRestClient();
     }
 
     /**
@@ -2459,20 +2380,6 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
      * @see SuiteScopeTestCase
      */
     protected void setupSuiteScopeCluster() throws Exception {}
-
-    private static boolean isSuiteScopedTest(Class<?> clazz) {
-        return clazz.getAnnotation(SuiteScopeTestCase.class) != null;
-    }
-
-    /*
-    * For tests defined with, SuiteScopeTestCase return true if the
-    * class has a constructor that takes a single Settings parameter
-    * */
-    private static boolean isSuiteScopedTestParameterized(Class<?> clazz) {
-        return Arrays.stream(clazz.getConstructors())
-            .filter(x -> x.getParameterTypes().length == 1)
-            .anyMatch(x -> x.getParameterTypes()[0].equals(Settings.class));
-    }
 
     /**
      * If a test is annotated with {@link SuiteScopeTestCase}
@@ -2572,6 +2479,12 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return clusterState.getRoutingNodes().node(nodeId).node().getName();
     }
 
+    protected String primaryNodeName(String indexName, int shardId) {
+        ClusterState clusterState = client().admin().cluster().prepareState().get().getState();
+        String nodeId = clusterState.getRoutingTable().index(indexName).shard(shardId).primaryShard().currentNodeId();
+        return clusterState.getRoutingNodes().node(nodeId).node().getName();
+    }
+
     protected String replicaNodeName(String indexName) {
         ClusterState clusterState = client().admin().cluster().prepareState().get().getState();
         String nodeId = clusterState.getRoutingTable().index(indexName).shard(0).replicaShards().get(0).currentNodeId();
@@ -2582,4 +2495,447 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return client(internalCluster().getClusterManagerName()).admin().cluster().prepareState().get().getState();
     }
 
+    /**
+     * Refreshes the indices in the cluster and waits until active/started replica shards
+     * are caught up with primary shard only when Segment Replication is enabled.
+     * This doesn't wait for inactive/non-started replica shards to become active/started.
+     */
+    protected RefreshResponse refreshAndWaitForReplication(String... indices) {
+        RefreshResponse refreshResponse = refresh(indices);
+        waitForReplication();
+        return refreshResponse;
+    }
+
+    public boolean isMigratingToRemoteStore() {
+        ClusterSettings clusterSettings = clusterService().getClusterSettings();
+        boolean isMixedMode = clusterSettings.get(REMOTE_STORE_COMPATIBILITY_MODE_SETTING)
+            .equals(RemoteStoreNodeService.CompatibilityMode.MIXED);
+        boolean isRemoteStoreMigrationDirection = clusterSettings.get(MIGRATION_DIRECTION_SETTING)
+            .equals(RemoteStoreNodeService.Direction.REMOTE_STORE);
+        return (isMixedMode && isRemoteStoreMigrationDirection);
+    }
+
+    /**
+     * Waits until active/started replica shards are caught up with primary shard only when Segment Replication is enabled.
+     * This doesn't wait for inactive/non-started replica shards to become active/started.
+     */
+    protected void waitForReplication(String... indices) {
+        if (indices.length == 0) {
+            indices = getClusterState().routingTable().indicesRouting().keySet().toArray(String[]::new);
+        }
+        try {
+            for (String index : indices) {
+                if (isSegmentReplicationEnabledForIndex(index)) {
+                    if (isInternalCluster()) {
+                        IndexRoutingTable indexRoutingTable = getClusterState().routingTable().index(index);
+                        if (indexRoutingTable != null) {
+                            assertBusy(() -> {
+                                for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
+                                    final ShardRouting primaryRouting = shardRoutingTable.primaryShard();
+                                    if (primaryRouting.state().toString().equals("STARTED")) {
+                                        if (isSegmentReplicationEnabledForIndex(index)) {
+                                            final List<ShardRouting> replicaRouting = shardRoutingTable.replicaShards();
+                                            final IndexShard primaryShard = getIndexShard(primaryRouting, index);
+                                            for (ShardRouting replica : replicaRouting) {
+                                                if (replica.state().toString().equals("STARTED")) {
+                                                    IndexShard replicaShard = getIndexShard(replica, index);
+                                                    if (replicaShard.indexSettings().isSegRepEnabledOrRemoteNode()) {
+                                                        assertEquals(
+                                                            "replica shards haven't caught up with primary",
+                                                            getLatestSegmentInfoVersion(primaryShard),
+                                                            getLatestSegmentInfoVersion(replicaShard)
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }, 30, TimeUnit.SECONDS);
+                        }
+                    } else {
+                        throw new IllegalStateException(
+                            "Segment Replication is not supported for testing tests using External Test Cluster"
+                        );
+                    }
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Checks if Segment Replication is enabled on Index.
+     */
+    protected boolean isSegmentReplicationEnabledForIndex(String index) {
+        return clusterService().state().getMetadata().isSegmentReplicationEnabled(index) || isMigratingToRemoteStore();
+    }
+
+    protected IndexShard getIndexShard(ShardRouting routing, String indexName) {
+        return getIndexShard(getClusterState().nodes().get(routing.currentNodeId()).getName(), routing.shardId(), indexName);
+    }
+
+    /**
+     * Fetch IndexShard by shardId, multiple shards per node allowed.
+     */
+    protected IndexShard getIndexShard(String node, ShardId shardId, String indexName) {
+        final Index index = resolveIndex(indexName);
+        IndicesService indicesService = internalCluster().getInstance(IndicesService.class, node);
+        IndexService indexService = indicesService.indexServiceSafe(index);
+        final Optional<Integer> id = indexService.shardIds().stream().filter(sid -> sid.equals(shardId.id())).findFirst();
+        return indexService.getShard(id.get());
+    }
+
+    /**
+     * Fetch latest segment info snapshot version of an index.
+     */
+    protected long getLatestSegmentInfoVersion(IndexShard shard) {
+        try (final GatedCloseable<SegmentInfos> snapshot = shard.getSegmentInfosSnapshot()) {
+            return snapshot.get().version;
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    protected void createRepository(String repoName, String type, Settings.Builder settings, String timeout) {
+        logger.info("--> creating repository [{}] [{}]", repoName, type);
+        putRepository(clusterAdmin(), repoName, type, timeout, settings);
+    }
+
+    protected void createRepository(String repoName, String type, Settings.Builder settings) {
+        logger.info("--> creating repository [{}] [{}]", repoName, type);
+        putRepository(clusterAdmin(), repoName, type, null, settings);
+    }
+
+    protected void updateRepository(String repoName, String type, Settings.Builder settings) {
+        logger.info("--> updating repository [{}] [{}]", repoName, type);
+        putRepository(clusterAdmin(), repoName, type, null, settings);
+    }
+
+    public Settings getNodeSettings() {
+        InternalTestCluster internalTestCluster = internalCluster();
+        ClusterService clusterService = internalTestCluster.getInstance(ClusterService.class, internalTestCluster.getClusterManagerName());
+        return clusterService.getSettings();
+    }
+
+    public static void putRepository(ClusterAdminClient adminClient, String repoName, String type, Settings.Builder settings) {
+        assertAcked(putRepositoryRequestBuilder(adminClient, repoName, type, true, settings, null, false));
+    }
+
+    public static void putRepository(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        String timeout,
+        Settings.Builder settings
+    ) {
+        assertAcked(putRepositoryRequestBuilder(adminClient, repoName, type, true, settings, timeout, false));
+    }
+
+    public static void putRepository(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        boolean verify,
+        Settings.Builder settings
+    ) {
+        assertAcked(putRepositoryRequestBuilder(adminClient, repoName, type, verify, settings, null, false));
+    }
+
+    public static void putRepositoryWithNoSettingOverrides(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        boolean verify,
+        Settings.Builder settings
+    ) {
+        assertAcked(putRepositoryRequestBuilder(adminClient, repoName, type, verify, settings, null, true));
+    }
+
+    public static void putRepository(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        Settings.Builder settings,
+        ActionListener<AcknowledgedResponse> listener
+    ) {
+        putRepositoryRequestBuilder(adminClient, repoName, type, true, settings, null, false).execute(listener);
+    }
+
+    public static PutRepositoryRequestBuilder putRepositoryRequestBuilder(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        boolean verify,
+        Settings.Builder settings,
+        String timeout,
+        boolean finalSettings
+    ) {
+        PutRepositoryRequestBuilder builder = adminClient.preparePutRepository(repoName).setType(type).setVerify(verify);
+        if (timeout != null) {
+            builder.setTimeout(timeout);
+        }
+        if (finalSettings == false) {
+            settings.put(BlobStoreRepository.SHARD_PATH_TYPE.getKey(), randomFrom(PathType.values()));
+        }
+        builder.setSettings(settings);
+        return builder;
+    }
+
+    public static Settings remoteStoreClusterSettings(String name, Path path) {
+        return remoteStoreClusterSettings(name, path, name, path);
+    }
+
+    public static Settings remoteStoreClusterSettings(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String segmentRepoType,
+        String translogRepoName,
+        Path translogRepoPath,
+        String translogRepoType
+    ) {
+        Settings.Builder settingsBuilder = Settings.builder();
+        settingsBuilder.put(
+            buildRemoteStoreNodeAttributes(
+                segmentRepoName,
+                segmentRepoPath,
+                segmentRepoType,
+                translogRepoName,
+                translogRepoPath,
+                translogRepoType,
+                false
+            )
+        );
+        return settingsBuilder.build();
+    }
+
+    public static Settings remoteStoreClusterSettings(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String segmentRepoType,
+        String translogRepoName,
+        Path translogRepoPath,
+        String translogRepoType,
+        String routingTableRepoName,
+        Path routingTableRepoPath,
+        String routingTableRepoType
+    ) {
+        Settings.Builder settingsBuilder = Settings.builder();
+        settingsBuilder.put(
+            buildRemoteStoreNodeAttributes(
+                segmentRepoName,
+                segmentRepoPath,
+                segmentRepoType,
+                translogRepoName,
+                translogRepoPath,
+                translogRepoType,
+                routingTableRepoName,
+                routingTableRepoPath,
+                routingTableRepoType,
+                false
+            )
+        );
+        return settingsBuilder.build();
+    }
+
+    public static Settings remoteStoreClusterSettings(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String translogRepoName,
+        Path translogRepoPath
+    ) {
+        Settings.Builder settingsBuilder = Settings.builder();
+        settingsBuilder.put(buildRemoteStoreNodeAttributes(segmentRepoName, segmentRepoPath, translogRepoName, translogRepoPath, false));
+        return settingsBuilder.build();
+    }
+
+    public static Settings remoteStoreClusterSettings(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String translogRepoName,
+        Path translogRepoPath,
+        String remoteRoutingTableRepoName,
+        Path remoteRoutingTableRepoPath
+    ) {
+        Settings.Builder settingsBuilder = Settings.builder();
+        settingsBuilder.put(
+            buildRemoteStoreNodeAttributes(
+                segmentRepoName,
+                segmentRepoPath,
+                translogRepoName,
+                translogRepoPath,
+                remoteRoutingTableRepoName,
+                remoteRoutingTableRepoPath,
+                false
+            )
+        );
+        return settingsBuilder.build();
+    }
+
+    public static Settings buildRemoteStoreNodeAttributes(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String translogRepoName,
+        Path translogRepoPath,
+        boolean withRateLimiterAttributes
+    ) {
+        return buildRemoteStoreNodeAttributes(
+            segmentRepoName,
+            segmentRepoPath,
+            ReloadableFsRepository.TYPE,
+            translogRepoName,
+            translogRepoPath,
+            ReloadableFsRepository.TYPE,
+            withRateLimiterAttributes
+        );
+    }
+
+    public static Settings buildRemoteStoreNodeAttributes(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String translogRepoName,
+        Path translogRepoPath,
+        String remoteRoutingTableRepoName,
+        Path remoteRoutingTableRepoPath,
+        boolean withRateLimiterAttributes
+    ) {
+        return buildRemoteStoreNodeAttributes(
+            segmentRepoName,
+            segmentRepoPath,
+            ReloadableFsRepository.TYPE,
+            translogRepoName,
+            translogRepoPath,
+            ReloadableFsRepository.TYPE,
+            remoteRoutingTableRepoName,
+            remoteRoutingTableRepoPath,
+            FsRepository.TYPE,
+            withRateLimiterAttributes
+        );
+    }
+
+    private static Settings buildRemoteStoreNodeAttributes(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String segmentRepoType,
+        String translogRepoName,
+        Path translogRepoPath,
+        String translogRepoType,
+        boolean withRateLimiterAttributes
+    ) {
+        return buildRemoteStoreNodeAttributes(
+            segmentRepoName,
+            segmentRepoPath,
+            segmentRepoType,
+            translogRepoName,
+            translogRepoPath,
+            translogRepoType,
+            null,
+            null,
+            null,
+            withRateLimiterAttributes
+        );
+    }
+
+    private static Settings buildRemoteStoreNodeAttributes(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String segmentRepoType,
+        String translogRepoName,
+        Path translogRepoPath,
+        String translogRepoType,
+        String routingTableRepoName,
+        Path routingTableRepoPath,
+        String routingTableRepoType,
+        boolean withRateLimiterAttributes
+    ) {
+        String segmentRepoTypeAttributeKey = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+            segmentRepoName
+        );
+        String segmentRepoSettingsAttributeKeyPrefix = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+            segmentRepoName
+        );
+        String translogRepoTypeAttributeKey = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+            translogRepoName
+        );
+        String translogRepoSettingsAttributeKeyPrefix = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+            translogRepoName
+        );
+        String stateRepoTypeAttributeKey = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+            segmentRepoName
+        );
+        String stateRepoSettingsAttributeKeyPrefix = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+            segmentRepoName
+        );
+        String routingTableRepoAttributeKey = null, routingTableRepoSettingsAttributeKeyPrefix = null;
+        if (routingTableRepoName != null) {
+            routingTableRepoAttributeKey = String.format(
+                Locale.getDefault(),
+                "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+                routingTableRepoName
+            );
+            routingTableRepoSettingsAttributeKeyPrefix = String.format(
+                Locale.getDefault(),
+                "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+                routingTableRepoName
+            );
+        }
+
+        String prefixModeVerificationSuffix = BlobStoreRepository.PREFIX_MODE_VERIFICATION_SETTING.getKey();
+
+        Settings.Builder settings = Settings.builder()
+            .put("node.attr." + REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY, segmentRepoName)
+            .put(segmentRepoTypeAttributeKey, segmentRepoType)
+            .put(segmentRepoSettingsAttributeKeyPrefix + "location", segmentRepoPath)
+            .put(segmentRepoSettingsAttributeKeyPrefix + prefixModeVerificationSuffix, prefixModeVerificationEnable)
+            .put("node.attr." + REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY, translogRepoName)
+            .put(translogRepoTypeAttributeKey, translogRepoType)
+            .put(translogRepoSettingsAttributeKeyPrefix + "location", translogRepoPath)
+            .put(translogRepoSettingsAttributeKeyPrefix + prefixModeVerificationSuffix, prefixModeVerificationEnable)
+            .put("node.attr." + REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY, segmentRepoName)
+            .put(stateRepoTypeAttributeKey, segmentRepoType)
+            .put(stateRepoSettingsAttributeKeyPrefix + "location", segmentRepoPath)
+            .put(stateRepoSettingsAttributeKeyPrefix + prefixModeVerificationSuffix, prefixModeVerificationEnable);
+        if (routingTableRepoName != null) {
+            settings.put("node.attr." + REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY, routingTableRepoName)
+                .put(routingTableRepoAttributeKey, routingTableRepoType)
+                .put(routingTableRepoSettingsAttributeKeyPrefix + "location", routingTableRepoPath);
+        }
+
+        if (withRateLimiterAttributes) {
+            settings.put(segmentRepoSettingsAttributeKeyPrefix + "compress", randomBoolean())
+                .put(segmentRepoSettingsAttributeKeyPrefix + "chunk_size", 200, ByteSizeUnit.BYTES);
+        }
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_PATH_TYPE_SETTING.getKey(), randomFrom(PathType.values()));
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_METADATA.getKey(), randomBoolean());
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_ENABLED.getKey(), false);
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENTS_PATH_PREFIX.getKey(), translogPathFixedPrefix ? "a" : "");
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX.getKey(), segmentsPathFixedPrefix ? "b" : "");
+        settings.put(BlobStoreRepository.SNAPSHOT_SHARD_PATH_PREFIX_SETTING.getKey(), segmentsPathFixedPrefix ? "c" : "");
+        return settings.build();
+    }
+
+    public static String resolvePath(IndexId indexId, String shardId) {
+        PathType pathType = PathType.fromCode(indexId.getShardPathType());
+        RemoteStorePathStrategy.SnapshotShardPathInput shardPathInput = new RemoteStorePathStrategy.SnapshotShardPathInput.Builder()
+            .basePath(BlobPath.cleanPath())
+            .indexUUID(indexId.getId())
+            .shardId(shardId)
+            .build();
+        RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm = pathType != PathType.FIXED ? FNV_1A_COMPOSITE_1 : null;
+        BlobPath blobPath = pathType.path(shardPathInput, pathHashAlgorithm);
+        return blobPath.buildAsString();
+    }
 }

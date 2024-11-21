@@ -168,7 +168,12 @@ public class S3RepositoryTests extends OpenSearchTestCase implements ConfigPathS
             null,
             null,
             null,
-            false
+            null,
+            false,
+            null,
+            null,
+            null,
+            null
         ) {
             @Override
             protected void assertSnapshotOrGenericThread() {

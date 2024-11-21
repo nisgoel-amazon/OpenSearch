@@ -43,6 +43,8 @@ import org.opensearch.client.Client;
 import org.opensearch.common.CheckedFunction;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.TriFunction;
+import org.opensearch.common.annotation.DeprecatedApi;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.action.ActionListener;
@@ -57,6 +59,9 @@ import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.cache.bitset.BitsetFilterCache;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.mapper.ContentPath;
+import org.opensearch.index.mapper.DerivedFieldResolver;
+import org.opensearch.index.mapper.DerivedFieldResolverFactory;
+import org.opensearch.index.mapper.DerivedFieldType;
 import org.opensearch.index.mapper.DocumentMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.Mapper;
@@ -76,6 +81,7 @@ import org.opensearch.transport.RemoteClusterAware;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -85,13 +91,16 @@ import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
+import static java.util.Collections.emptyList;
+import static java.util.Collections.emptyMap;
 import static java.util.Collections.unmodifiableMap;
 
 /**
  * Context object used to create lucene queries on the shard level.
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class QueryShardContext extends QueryRewriteContext {
 
     private final ScriptService scriptService;
@@ -116,6 +125,8 @@ public class QueryShardContext extends QueryRewriteContext {
     private NestedScope nestedScope;
     private final ValuesSourceRegistry valuesSourceRegistry;
     private BitSetProducer parentFilter;
+    private DerivedFieldResolver derivedFieldResolver;
+    private boolean keywordIndexOrDocValuesEnabled;
 
     public QueryShardContext(
         int shardId,
@@ -199,7 +210,55 @@ public class QueryShardContext extends QueryRewriteContext {
             ),
             allowExpensiveQueries,
             valuesSourceRegistry,
-            validate
+            validate,
+            false
+        );
+    }
+
+    public QueryShardContext(
+        int shardId,
+        IndexSettings indexSettings,
+        BigArrays bigArrays,
+        BitsetFilterCache bitsetFilterCache,
+        TriFunction<MappedFieldType, String, Supplier<SearchLookup>, IndexFieldData<?>> indexFieldDataLookup,
+        MapperService mapperService,
+        SimilarityService similarityService,
+        ScriptService scriptService,
+        NamedXContentRegistry xContentRegistry,
+        NamedWriteableRegistry namedWriteableRegistry,
+        Client client,
+        IndexSearcher searcher,
+        LongSupplier nowInMillis,
+        String clusterAlias,
+        Predicate<String> indexNameMatcher,
+        BooleanSupplier allowExpensiveQueries,
+        ValuesSourceRegistry valuesSourceRegistry,
+        boolean validate,
+        boolean keywordIndexOrDocValuesEnabled
+    ) {
+        this(
+            shardId,
+            indexSettings,
+            bigArrays,
+            bitsetFilterCache,
+            indexFieldDataLookup,
+            mapperService,
+            similarityService,
+            scriptService,
+            xContentRegistry,
+            namedWriteableRegistry,
+            client,
+            searcher,
+            nowInMillis,
+            indexNameMatcher,
+            new Index(
+                RemoteClusterAware.buildRemoteIndexName(clusterAlias, indexSettings.getIndex().getName()),
+                indexSettings.getIndex().getUUID()
+            ),
+            allowExpensiveQueries,
+            valuesSourceRegistry,
+            validate,
+            keywordIndexOrDocValuesEnabled
         );
     }
 
@@ -222,7 +281,8 @@ public class QueryShardContext extends QueryRewriteContext {
             source.fullyQualifiedIndex,
             source.allowExpensiveQueries,
             source.valuesSourceRegistry,
-            source.validate()
+            source.validate(),
+            source.keywordIndexOrDocValuesEnabled
         );
     }
 
@@ -244,7 +304,8 @@ public class QueryShardContext extends QueryRewriteContext {
         Index fullyQualifiedIndex,
         BooleanSupplier allowExpensiveQueries,
         ValuesSourceRegistry valuesSourceRegistry,
-        boolean validate
+        boolean validate,
+        boolean keywordIndexOrDocValuesEnabled
     ) {
         super(xContentRegistry, namedWriteableRegistry, client, nowInMillis, validate);
         this.shardId = shardId;
@@ -254,7 +315,7 @@ public class QueryShardContext extends QueryRewriteContext {
         this.bitsetFilterCache = bitsetFilterCache;
         this.indexFieldDataService = indexFieldDataLookup;
         this.allowUnmappedFields = indexSettings.isDefaultAllowUnmappedFields();
-        this.nestedScope = new NestedScope();
+        this.nestedScope = new NestedScope(indexSettings);
         this.scriptService = scriptService;
         this.indexSettings = indexSettings;
         this.searcher = searcher;
@@ -262,13 +323,20 @@ public class QueryShardContext extends QueryRewriteContext {
         this.fullyQualifiedIndex = fullyQualifiedIndex;
         this.allowExpensiveQueries = allowExpensiveQueries;
         this.valuesSourceRegistry = valuesSourceRegistry;
+        this.derivedFieldResolver = DerivedFieldResolverFactory.createResolver(
+            this,
+            emptyMap(),
+            emptyList(),
+            indexSettings.isDerivedFieldAllowed()
+        );
+        this.keywordIndexOrDocValuesEnabled = keywordIndexOrDocValuesEnabled;
     }
 
     private void reset() {
         allowUnmappedFields = indexSettings.isDefaultAllowUnmappedFields();
         this.lookup = null;
         this.namedQueries.clear();
-        this.nestedScope = new NestedScope();
+        this.nestedScope = new NestedScope(indexSettings);
     }
 
     public IndexAnalyzers getIndexAnalyzers() {
@@ -327,7 +395,9 @@ public class QueryShardContext extends QueryRewriteContext {
      * type then the fields will be returned with a type prefix.
      */
     public Set<String> simpleMatchToIndexNames(String pattern) {
-        return mapperService.simpleMatchToFullName(pattern);
+        Set<String> allMatchingFields = new HashSet<>(mapperService.simpleMatchToFullName(pattern));
+        allMatchingFields.addAll(derivedFieldResolver.resolvePattern(pattern));
+        return allMatchingFields;
     }
 
     /**
@@ -393,6 +463,28 @@ public class QueryShardContext extends QueryRewriteContext {
         return valuesSourceRegistry;
     }
 
+    public void setDerivedFieldResolver(DerivedFieldResolver derivedFieldResolver) {
+        this.derivedFieldResolver = derivedFieldResolver;
+    }
+
+    @DeprecatedApi(since = "2.15.0")
+    public void setDerivedFieldTypes(Map<String, MappedFieldType> derivedFieldTypeMap) {
+        throw new UnsupportedOperationException("Use setDerivedFieldResolver() instead.");
+    }
+
+    @DeprecatedApi(since = "2.15.0")
+    public MappedFieldType getDerivedFieldType(String fieldName) {
+        throw new UnsupportedOperationException("Use resolveDerivedFieldType() instead.");
+    }
+
+    public boolean keywordFieldIndexOrDocValuesEnabled() {
+        return keywordIndexOrDocValuesEnabled;
+    }
+
+    public void setKeywordFieldIndexOrDocValuesEnabled(boolean keywordIndexOrDocValuesEnabled) {
+        this.keywordIndexOrDocValuesEnabled = keywordIndexOrDocValuesEnabled;
+    }
+
     public void setAllowUnmappedFields(boolean allowUnmappedFields) {
         this.allowUnmappedFields = allowUnmappedFields;
     }
@@ -402,7 +494,16 @@ public class QueryShardContext extends QueryRewriteContext {
     }
 
     MappedFieldType failIfFieldMappingNotFound(String name, MappedFieldType fieldMapping) {
-        if (fieldMapping != null || allowUnmappedFields) {
+        if (fieldMapping != null) {
+            if (fieldMapping instanceof DerivedFieldType) {
+                // resolveDerivedFieldType() will give precedence to search time definitions over index mapping, thus
+                // calling it instead of directly returning. It also ensures the feature flags are honoured.
+                return resolveDerivedFieldType(name);
+            }
+            return fieldMapping;
+        } else if ((fieldMapping = resolveDerivedFieldType(name)) != null) {
+            return fieldMapping;
+        } else if (allowUnmappedFields) {
             return fieldMapping;
         } else if (mapUnmappedFieldAsString) {
             TextFieldMapper.Builder builder = new TextFieldMapper.Builder(name, mapperService.getIndexAnalyzers());
@@ -410,6 +511,10 @@ public class QueryShardContext extends QueryRewriteContext {
         } else {
             throw new QueryShardException(this, "No field mapping can be found for the field with name [{}]", name);
         }
+    }
+
+    public MappedFieldType resolveDerivedFieldType(String name) {
+        return derivedFieldResolver.resolve(name);
     }
 
     private SearchLookup lookup = null;
@@ -421,7 +526,8 @@ public class QueryShardContext extends QueryRewriteContext {
         if (this.lookup == null) {
             this.lookup = new SearchLookup(
                 getMapperService(),
-                (fieldType, searchLookup) -> indexFieldDataService.apply(fieldType, fullyQualifiedIndex.getName(), searchLookup)
+                (fieldType, searchLookup) -> indexFieldDataService.apply(fieldType, fullyQualifiedIndex.getName(), searchLookup),
+                shardId
             );
         }
         return this.lookup;
@@ -437,7 +543,8 @@ public class QueryShardContext extends QueryRewriteContext {
          */
         return new SearchLookup(
             getMapperService(),
-            (fieldType, searchLookup) -> indexFieldDataService.apply(fieldType, fullyQualifiedIndex.getName(), searchLookup)
+            (fieldType, searchLookup) -> indexFieldDataService.apply(fieldType, fullyQualifiedIndex.getName(), searchLookup),
+            shardId
         );
     }
 
@@ -510,7 +617,7 @@ public class QueryShardContext extends QueryRewriteContext {
     /**
      * This method fails if {@link #freezeContext()} is called before on this
      * context. This is used to <i>seal</i>.
-     *
+     * <p>
      * This methods and all methods that call it should be final to ensure that
      * setting the request as not cacheable and the freezing behaviour of this
      * class cannot be bypassed. This is important so we can trust when this

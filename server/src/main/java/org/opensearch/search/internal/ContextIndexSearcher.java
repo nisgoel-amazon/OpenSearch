@@ -64,11 +64,12 @@ import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.CombinedBitSet;
 import org.apache.lucene.util.SparseFixedBitSet;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
 import org.opensearch.search.DocValueFormat;
-import org.opensearch.search.SearchBootstrapSettings;
 import org.opensearch.search.SearchService;
+import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.dfs.AggregatedDfs;
 import org.opensearch.search.profile.ContextualProfileBreakdown;
 import org.opensearch.search.profile.Timer;
@@ -92,8 +93,9 @@ import java.util.concurrent.Executor;
 /**
  * Context-aware extension of {@link IndexSearcher}.
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
     private static final Logger logger = LogManager.getLogger(ContextIndexSearcher.class);
@@ -101,6 +103,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
      * The interval at which we check for search cancellation when we cannot use
      * a {@link CancellableBulkScorer}. See {@link #intersectScorerAndBitSet}.
      */
+
     private static final int CHECK_CANCELLED_SCORER_INTERVAL = 1 << 11;
 
     private AggregatedDfs aggregatedDfs;
@@ -216,6 +219,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 profiler.pollLastElement();
             }
             return new ProfileWeight(query, weight, profile);
+        } else if (query instanceof ApproximateScoreQuery) {
+            ((ApproximateScoreQuery) query).setContext(searchContext);
+            return super.createWeight(query, scoreMode, boost);
         } else {
             return super.createWeight(query, scoreMode, boost);
         }
@@ -268,25 +274,32 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
     @Override
     protected void search(List<LeafReaderContext> leaves, Weight weight, Collector collector) throws IOException {
-        // Time series based workload by default traverses segments in desc order i.e. latest to the oldest order.
-        // This is actually beneficial for search queries to start search on latest segments first for time series workload.
-        // That can slow down ASC order queries on timestamp workload. So to avoid that slowdown, we will reverse leaf
-        // reader order here.
-        if (searchContext.shouldUseTimeSeriesDescSortOptimization()) {
-            for (int i = leaves.size() - 1; i >= 0; i--) {
-                searchLeaf(leaves.get(i), weight, collector);
+        searchContext.indexShard().getSearchOperationListener().onPreSliceExecution(searchContext);
+        try {
+            // Time series based workload by default traverses segments in desc order i.e. latest to the oldest order.
+            // This is actually beneficial for search queries to start search on latest segments first for time series workload.
+            // That can slow down ASC order queries on timestamp workload. So to avoid that slowdown, we will reverse leaf
+            // reader order here.
+            if (searchContext.shouldUseTimeSeriesDescSortOptimization()) {
+                for (int i = leaves.size() - 1; i >= 0; i--) {
+                    searchLeaf(leaves.get(i), weight, collector);
+                }
+            } else {
+                for (int i = 0; i < leaves.size(); i++) {
+                    searchLeaf(leaves.get(i), weight, collector);
+                }
             }
-        } else {
-            for (int i = 0; i < leaves.size(); i++) {
-                searchLeaf(leaves.get(i), weight, collector);
-            }
+            searchContext.bucketCollectorProcessor().processPostCollection(collector);
+        } catch (Throwable t) {
+            searchContext.indexShard().getSearchOperationListener().onFailedSliceExecution(searchContext);
+            throw t;
         }
-        searchContext.bucketCollectorProcessor().processPostCollection(collector);
+        searchContext.indexShard().getSearchOperationListener().onSliceExecution(searchContext);
     }
 
     /**
      * Lower-level search API.
-     *
+     * <p>
      * {@link LeafCollector#collect(int)} is called for every matching document in
      * the provided <code>ctx</code>.
      */
@@ -300,6 +313,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         final LeafCollector leafCollector;
         try {
             cancellable.checkCancelled();
+            if (weight instanceof ProfileWeight) {
+                ((ProfileWeight) weight).associateCollectorToLeaves(ctx, collector);
+            }
             weight = wrapWeight(weight);
             // See please https://github.com/apache/lucene/pull/964
             collector.setWeight(weight);
@@ -348,6 +364,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 }
             }
         }
+
+        // Note: this is called if collection ran successfully, including the above special cases of
+        // CollectionTerminatedException and TimeExceededException, but no other exception.
+        leafCollector.finish();
     }
 
     private Weight wrapWeight(Weight weight) {
@@ -377,6 +397,11 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                     } else {
                         return null;
                     }
+                }
+
+                @Override
+                public int count(LeafReaderContext context) throws IOException {
+                    return weight.count(context);
                 }
             };
         } else {
@@ -451,9 +476,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
      */
     @Override
     protected LeafSlice[] slices(List<LeafReaderContext> leaves) {
-        // For now using the static setting to get the targetMaxSlice value. It will be updated to dynamic mechanism as part of
-        // https://github.com/opensearch-project/OpenSearch/issues/8870 when lucene changes are available
-        return slicesInternal(leaves, SearchBootstrapSettings.getTargetMaxSlice());
+        return slicesInternal(leaves, searchContext.getTargetMaxSliceCount());
     }
 
     public DirectoryReader getDirectoryReader() {
@@ -501,14 +524,15 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     }
 
     private boolean canMatchSearchAfter(LeafReaderContext ctx) throws IOException {
-        if (searchContext.request() != null && searchContext.request().source() != null) {
+        if (searchContext.searchAfter() != null && searchContext.request() != null && searchContext.request().source() != null) {
             // Only applied on primary sort field and primary search_after.
             FieldSortBuilder primarySortField = FieldSortBuilder.getPrimaryFieldSortOrNull(searchContext.request().source());
             if (primarySortField != null) {
                 MinAndMax<?> minMax = FieldSortBuilder.getMinMaxOrNullForSegment(
                     this.searchContext.getQueryShardContext(),
                     ctx,
-                    primarySortField
+                    primarySortField,
+                    searchContext.sort()
                 );
                 return SearchService.canMatchSearchAfter(
                     searchContext.searchAfter(),

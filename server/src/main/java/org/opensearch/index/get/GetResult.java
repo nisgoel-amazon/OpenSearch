@@ -35,8 +35,10 @@ package org.opensearch.index.get;
 import org.opensearch.LegacyESVersion;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.Version;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.xcontent.XContentHelper;
+import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -56,6 +58,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 
@@ -69,6 +72,7 @@ import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
  *
  * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class GetResult implements Writeable, Iterable<DocumentField>, ToXContentObject {
 
     public static final String _INDEX = "_index";
@@ -409,6 +413,14 @@ public class GetResult implements Writeable, Iterable<DocumentField>, ToXContent
                 }
             }
         }
+
+        if (found == null) {
+            throw new ParsingException(
+                parser.getTokenLocation(),
+                String.format(Locale.ROOT, "Missing required field [%s]", GetResult.FOUND)
+            );
+        }
+
         return new GetResult(index, id, seqNo, primaryTerm, version, found, source, documentFields, metaFields);
     }
 

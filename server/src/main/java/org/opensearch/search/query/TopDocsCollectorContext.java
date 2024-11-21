@@ -95,7 +95,7 @@ import static org.opensearch.search.profile.query.CollectorResult.REASON_SEARCH_
  *
  * @opensearch.internal
  */
-public abstract class TopDocsCollectorContext extends QueryCollectorContext {
+public abstract class TopDocsCollectorContext extends QueryCollectorContext implements RescoringQueryCollectorContext {
     protected final int numHits;
 
     TopDocsCollectorContext(String profilerName, int numHits) {
@@ -532,7 +532,7 @@ public abstract class TopDocsCollectorContext extends QueryCollectorContext {
                     float score = collector.getMaxScore();
                     if (Float.isNaN(maxScore)) {
                         maxScore = score;
-                    } else {
+                    } else if (!Float.isNaN(score)) {
                         maxScore = Math.max(maxScore, score);
                     }
                 }

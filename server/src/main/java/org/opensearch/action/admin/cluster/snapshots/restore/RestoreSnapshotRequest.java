@@ -38,6 +38,7 @@ import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentType;
@@ -64,15 +65,19 @@ import static org.opensearch.common.xcontent.support.XContentMapValues.nodeBoole
 /**
  * Restore snapshot request
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSnapshotRequest> implements ToXContentObject {
 
     private static final DeprecationLogger DEPRECATION_LOGGER = DeprecationLogger.getLogger(RestoreSnapshotRequest.class);
 
     /**
      * Enumeration of possible storage types
+     *
+     * @opensearch.api
      */
+    @PublicApi(since = "1.0.0")
     public enum StorageType {
         LOCAL("local"),
         REMOTE_SNAPSHOT("remote_snapshot");
@@ -117,6 +122,8 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
     private StorageType storageType = StorageType.LOCAL;
     @Nullable
     private String sourceRemoteStoreRepository = null;
+    @Nullable
+    private String sourceRemoteTranslogRepository = null;
 
     @Nullable // if any snapshot UUID will do
     private String snapshotUuid;
@@ -160,6 +167,9 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
         if (in.getVersion().onOrAfter(Version.V_2_10_0)) {
             sourceRemoteStoreRepository = in.readOptionalString();
         }
+        if (in.getVersion().onOrAfter(Version.V_2_17_0)) {
+            sourceRemoteTranslogRepository = in.readOptionalString();
+        }
     }
 
     @Override
@@ -192,6 +202,9 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
         }
         if (out.getVersion().onOrAfter(Version.V_2_10_0)) {
             out.writeOptionalString(sourceRemoteStoreRepository);
+        }
+        if (out.getVersion().onOrAfter(Version.V_2_17_0)) {
+            out.writeOptionalString(sourceRemoteTranslogRepository);
         }
     }
 
@@ -512,7 +525,7 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
      * this is the snapshot that this request restores. If the client can only identify a snapshot by its name then there is a risk that the
      * desired snapshot may be deleted and replaced by a new snapshot with the same name which is inconsistent with the original one. This
      * method lets us fail the restore if the precise snapshot we want is not available.
-     *
+     * <p>
      * This is for internal use only and is not exposed in the REST layer.
      */
     public RestoreSnapshotRequest snapshotUuid(String snapshotUuid) {
@@ -556,12 +569,31 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
     }
 
     /**
+     * Sets Source Remote Translog Repository for all the restored indices
+     *
+     * @param sourceRemoteTranslogRepository name of the remote translog repository that should be used for all restored indices.
+     */
+    public RestoreSnapshotRequest setSourceRemoteTranslogRepository(String sourceRemoteTranslogRepository) {
+        this.sourceRemoteTranslogRepository = sourceRemoteTranslogRepository;
+        return this;
+    }
+
+    /**
      * Returns Source Remote Store Repository for all the restored indices
      *
      * @return source Remote Store Repository
      */
     public String getSourceRemoteStoreRepository() {
         return sourceRemoteStoreRepository;
+    }
+
+    /**
+     * Returns Source Remote Translog Repository for all the restored indices
+     *
+     * @return source Remote Translog Repository
+     */
+    public String getSourceRemoteTranslogRepository() {
+        return sourceRemoteTranslogRepository;
     }
 
     /**
@@ -683,6 +715,9 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
         if (sourceRemoteStoreRepository != null) {
             builder.field("source_remote_store_repository", sourceRemoteStoreRepository);
         }
+        if (sourceRemoteTranslogRepository != null) {
+            builder.field("source_remote_translog_repository", sourceRemoteTranslogRepository);
+        }
         builder.endObject();
         return builder;
     }
@@ -711,7 +746,8 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
             && Arrays.equals(ignoreIndexSettings, that.ignoreIndexSettings)
             && Objects.equals(snapshotUuid, that.snapshotUuid)
             && Objects.equals(storageType, that.storageType)
-            && Objects.equals(sourceRemoteStoreRepository, that.sourceRemoteStoreRepository);
+            && Objects.equals(sourceRemoteStoreRepository, that.sourceRemoteStoreRepository)
+            && Objects.equals(sourceRemoteTranslogRepository, that.sourceRemoteTranslogRepository);
         return equals;
     }
 
@@ -731,7 +767,8 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
             indexSettings,
             snapshotUuid,
             storageType,
-            sourceRemoteStoreRepository
+            sourceRemoteStoreRepository,
+            sourceRemoteTranslogRepository
         );
         result = 31 * result + Arrays.hashCode(indices);
         result = 31 * result + Arrays.hashCode(ignoreIndexSettings);

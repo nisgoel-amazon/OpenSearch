@@ -18,6 +18,7 @@ import org.opensearch.node.Node;
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -45,7 +46,19 @@ public class RemoteStoreNodeAttribute {
         + "."
         + CryptoMetadata.SETTINGS_KEY;
     public static final String REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX = "remote_store.repository.%s.settings.";
+    public static final String REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY = "remote_store.routing_table.repository";
+
     private final RepositoriesMetadata repositoriesMetadata;
+
+    public static List<String> SUPPORTED_DATA_REPO_NAME_ATTRIBUTES = List.of(
+        REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY,
+        REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY
+    );
+
+    public static List<String> REMOTE_CLUSTER_PUBLICATION_REPO_NAME_ATTRIBUTES = List.of(
+        REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY,
+        REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY
+    );
 
     /**
      * Creates a new {@link RemoteStoreNodeAttribute}
@@ -131,12 +144,8 @@ public class RemoteStoreNodeAttribute {
     }
 
     private RepositoriesMetadata buildRepositoriesMetadata(DiscoveryNode node) {
+        Set<String> repositoryNames = getValidatedRepositoryNames(node);
         List<RepositoryMetadata> repositoryMetadataList = new ArrayList<>();
-        Set<String> repositoryNames = new HashSet<>();
-
-        repositoryNames.add(validateAttributeNonNull(node, REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY));
-        repositoryNames.add(validateAttributeNonNull(node, REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY));
-        repositoryNames.add(validateAttributeNonNull(node, REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY));
 
         for (String repositoryName : repositoryNames) {
             repositoryMetadataList.add(buildRepositoryMetadata(node, repositoryName));
@@ -145,16 +154,85 @@ public class RemoteStoreNodeAttribute {
         return new RepositoriesMetadata(repositoryMetadataList);
     }
 
+    private Set<String> getValidatedRepositoryNames(DiscoveryNode node) {
+        Set<String> repositoryNames = new HashSet<>();
+        if (node.getAttributes().containsKey(REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY)
+            || node.getAttributes().containsKey(REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY)) {
+            repositoryNames.add(validateAttributeNonNull(node, REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY));
+            repositoryNames.add(validateAttributeNonNull(node, REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY));
+            repositoryNames.add(validateAttributeNonNull(node, REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY));
+        } else if (node.getAttributes().containsKey(REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY)) {
+            repositoryNames.add(validateAttributeNonNull(node, REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY));
+        }
+        if (node.getAttributes().containsKey(REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY)) {
+            repositoryNames.add(validateAttributeNonNull(node, REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY));
+        }
+
+        return repositoryNames;
+    }
+
     public static boolean isRemoteStoreAttributePresent(Settings settings) {
         return settings.getByPrefix(Node.NODE_ATTRIBUTES.getKey() + REMOTE_STORE_NODE_ATTRIBUTE_KEY_PREFIX).isEmpty() == false;
     }
 
+    public static boolean isRemoteDataAttributePresent(Settings settings) {
+        return settings.getByPrefix(Node.NODE_ATTRIBUTES.getKey() + REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY).isEmpty() == false
+            || settings.getByPrefix(Node.NODE_ATTRIBUTES.getKey() + REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY).isEmpty() == false;
+    }
+
+    public static boolean isRemoteClusterStateAttributePresent(Settings settings) {
+        return settings.getByPrefix(Node.NODE_ATTRIBUTES.getKey() + REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY)
+            .isEmpty() == false;
+    }
+
+    public static String getRemoteStoreSegmentRepo(Settings settings) {
+        return settings.get(Node.NODE_ATTRIBUTES.getKey() + RemoteStoreNodeAttribute.REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY);
+    }
+
+    public static String getRemoteStoreTranslogRepo(Settings settings) {
+        return settings.get(Node.NODE_ATTRIBUTES.getKey() + RemoteStoreNodeAttribute.REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY);
+    }
+
     public static boolean isRemoteStoreClusterStateEnabled(Settings settings) {
-        return RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.get(settings) && isRemoteStoreAttributePresent(settings);
+        return RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.get(settings)
+            && isRemoteClusterStateAttributePresent(settings);
+    }
+
+    private static boolean isRemoteRoutingTableAttributePresent(Settings settings) {
+        return settings.getByPrefix(Node.NODE_ATTRIBUTES.getKey() + REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY)
+            .isEmpty() == false;
+    }
+
+    public static boolean isRemoteRoutingTableEnabled(Settings settings) {
+        return isRemoteRoutingTableAttributePresent(settings);
     }
 
     public RepositoriesMetadata getRepositoriesMetadata() {
         return this.repositoriesMetadata;
+    }
+
+    /**
+     * Return {@link Map} of all the supported data repo names listed on {@link RemoteStoreNodeAttribute#SUPPORTED_DATA_REPO_NAME_ATTRIBUTES}
+     *
+     * @param node Node to fetch attributes from
+     * @return {@link Map} of all remote store data repo attribute keys and their values
+     */
+    public static Map<String, String> getDataRepoNames(DiscoveryNode node) {
+        assert remoteDataAttributesPresent(node.getAttributes());
+        Map<String, String> dataRepoNames = new HashMap<>();
+        for (String supportedRepoAttribute : SUPPORTED_DATA_REPO_NAME_ATTRIBUTES) {
+            dataRepoNames.put(supportedRepoAttribute, node.getAttributes().get(supportedRepoAttribute));
+        }
+        return dataRepoNames;
+    }
+
+    private static boolean remoteDataAttributesPresent(Map<String, String> nodeAttrs) {
+        for (String supportedRepoAttributes : SUPPORTED_DATA_REPO_NAME_ATTRIBUTES) {
+            if (nodeAttrs.get(supportedRepoAttributes) == null || nodeAttrs.get(supportedRepoAttributes).isEmpty()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override
@@ -171,6 +249,29 @@ public class RemoteStoreNodeAttribute {
                 : Objects.hash(repositoryMetadata.name(), repositoryMetadata.type(), repositoryMetadata.settings()));
         }
         return hashCode;
+    }
+
+    /**
+     * Checks if 2 instances are equal, with option to skip check for a list of repos.
+     * *
+     * @param o other instance
+     * @param reposToSkip list of repos to skip check for equality
+     * @return {@code true} iff both instances are equal, not including the repositories in both instances if they are part of reposToSkip.
+     */
+    public boolean equalsWithRepoSkip(Object o, List<String> reposToSkip) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        RemoteStoreNodeAttribute that = (RemoteStoreNodeAttribute) o;
+        return this.getRepositoriesMetadata().equalsIgnoreGenerationsWithRepoSkip(that.getRepositoriesMetadata(), reposToSkip);
+    }
+
+    public boolean equalsForRepositories(Object otherNode, List<String> repositoryToValidate) {
+        if (this == otherNode) return true;
+        if (otherNode == null || getClass() != otherNode.getClass()) return false;
+
+        RemoteStoreNodeAttribute other = (RemoteStoreNodeAttribute) otherNode;
+        return this.getRepositoriesMetadata().equalsIgnoreGenerationsForRepo(other.repositoriesMetadata, repositoryToValidate);
     }
 
     @Override

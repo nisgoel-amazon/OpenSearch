@@ -44,6 +44,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.RepositoryMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Priority;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.BlobStoreException;
@@ -52,6 +53,7 @@ import org.opensearch.common.settings.SecureSetting;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.settings.SecureString;
@@ -66,6 +68,7 @@ import org.opensearch.repositories.ShardGenerations;
 import org.opensearch.repositories.blobstore.MeteredBlobStoreRepository;
 import org.opensearch.repositories.s3.async.AsyncExecutorContainer;
 import org.opensearch.repositories.s3.async.AsyncTransferManager;
+import org.opensearch.repositories.s3.async.SizeBasedBlockingQ;
 import org.opensearch.snapshots.SnapshotId;
 import org.opensearch.snapshots.SnapshotInfo;
 import org.opensearch.snapshots.SnapshotsService;
@@ -154,6 +157,29 @@ class S3Repository extends MeteredBlobStoreRepository {
     static final ByteSizeValue MAX_FILE_SIZE_USING_MULTIPART = new ByteSizeValue(5, ByteSizeUnit.TB);
 
     /**
+     * Whether large uploads need to be redirected to slow sync s3 client.
+     */
+    static final Setting<Boolean> REDIRECT_LARGE_S3_UPLOAD = Setting.boolSetting(
+        "redirect_large_s3_upload",
+        true,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Whether large uploads need to be redirected to slow sync s3 client.
+     */
+    static final Setting<Boolean> PERMIT_BACKED_TRANSFER_ENABLED = Setting.boolSetting(
+        "permit_backed_transfer_enabled",
+        true,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Whether retry on uploads are enabled. This setting wraps inputstream with buffered stream to enable retries.
+     */
+    static final Setting<Boolean> UPLOAD_RETRY_ENABLED = Setting.boolSetting("s3_upload_retry_enabled", true, Setting.Property.NodeScope);
+
+    /**
      * Minimum threshold below which the chunk is uploaded using a single request. Beyond this threshold,
      * the S3 repository will use the AWS Multipart Upload API to split the chunk into several parts, each of buffer_size length, and
      * to upload each part in its own request. Note that setting a buffer size lower than 5mb is not allowed since it will prevents the
@@ -185,6 +211,37 @@ class S3Repository extends MeteredBlobStoreRepository {
         true,
         Setting.Property.NodeScope
     );
+    /**
+     * Percentage of total available permits to be available for priority transfers.
+     */
+    public static Setting<Integer> S3_PRIORITY_PERMIT_ALLOCATION_PERCENT = Setting.intSetting(
+        "s3_priority_permit_alloc_perc",
+        70,
+        21,
+        80,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Duration in minutes to wait for a permit in case no permit is available.
+     */
+    public static Setting<Integer> S3_PERMIT_WAIT_DURATION_MIN = Setting.intSetting(
+        "s3_permit_wait_duration_min",
+        5,
+        1,
+        10,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Number of transfer queue consumers
+     */
+    public static Setting<Integer> S3_TRANSFER_QUEUE_CONSUMERS = new Setting<>(
+        "s3_transfer_queue_consumers",
+        (s) -> Integer.toString(Math.max(5, OpenSearchExecutors.allocatedProcessors(s) * 2)),
+        (s) -> Setting.parseInt(s, 5, "s3_transfer_queue_consumers"),
+        Setting.Property.NodeScope
+    );
 
     /**
      * Big files can be broken down into chunks during snapshotting if needed. Defaults to 1g.
@@ -195,6 +252,13 @@ class S3Repository extends MeteredBlobStoreRepository {
         new ByteSizeValue(5, ByteSizeUnit.MB),
         new ByteSizeValue(5, ByteSizeUnit.TB)
     );
+
+    /**
+     * Maximum number of deletes in a DeleteObjectsRequest.
+     *
+     * @see <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html">S3 Documentation</a>.
+     */
+    static final Setting<Integer> BULK_DELETE_SIZE = Setting.intSetting("bulk_delete_size", 1000, 1, 1000);
 
     /**
      * Sets the S3 storage class type for the backup files. Values may be standard, reduced_redundancy,
@@ -258,9 +322,15 @@ class S3Repository extends MeteredBlobStoreRepository {
     private final AsyncTransferManager asyncUploadUtils;
     private final S3AsyncService s3AsyncService;
     private final boolean multipartUploadEnabled;
+    private final AsyncExecutorContainer urgentExecutorBuilder;
     private final AsyncExecutorContainer priorityExecutorBuilder;
     private final AsyncExecutorContainer normalExecutorBuilder;
     private final Path pluginConfigPath;
+    private final SizeBasedBlockingQ normalPrioritySizeBasedBlockingQ;
+    private final SizeBasedBlockingQ lowPrioritySizeBasedBlockingQ;
+    private final GenericStatsMetricPublisher genericStatsMetricPublisher;
+
+    private volatile int bulkDeletesSize;
 
     // Used by test classes
     S3Repository(
@@ -270,10 +340,14 @@ class S3Repository extends MeteredBlobStoreRepository {
         final ClusterService clusterService,
         final RecoverySettings recoverySettings,
         final AsyncTransferManager asyncUploadUtils,
+        final AsyncExecutorContainer urgentExecutorBuilder,
         final AsyncExecutorContainer priorityExecutorBuilder,
         final AsyncExecutorContainer normalExecutorBuilder,
         final S3AsyncService s3AsyncService,
-        final boolean multipartUploadEnabled
+        final boolean multipartUploadEnabled,
+        final SizeBasedBlockingQ normalPrioritySizeBasedBlockingQ,
+        final SizeBasedBlockingQ lowPrioritySizeBasedBlockingQ,
+        final GenericStatsMetricPublisher genericStatsMetricPublisher
     ) {
         this(
             metadata,
@@ -282,11 +356,15 @@ class S3Repository extends MeteredBlobStoreRepository {
             clusterService,
             recoverySettings,
             asyncUploadUtils,
+            urgentExecutorBuilder,
             priorityExecutorBuilder,
             normalExecutorBuilder,
             s3AsyncService,
             multipartUploadEnabled,
-            Path.of("")
+            Path.of(""),
+            normalPrioritySizeBasedBlockingQ,
+            lowPrioritySizeBasedBlockingQ,
+            genericStatsMetricPublisher
         );
     }
 
@@ -300,11 +378,15 @@ class S3Repository extends MeteredBlobStoreRepository {
         final ClusterService clusterService,
         final RecoverySettings recoverySettings,
         final AsyncTransferManager asyncUploadUtils,
+        final AsyncExecutorContainer urgentExecutorBuilder,
         final AsyncExecutorContainer priorityExecutorBuilder,
         final AsyncExecutorContainer normalExecutorBuilder,
         final S3AsyncService s3AsyncService,
         final boolean multipartUploadEnabled,
-        Path pluginConfigPath
+        Path pluginConfigPath,
+        final SizeBasedBlockingQ normalPrioritySizeBasedBlockingQ,
+        final SizeBasedBlockingQ lowPrioritySizeBasedBlockingQ,
+        final GenericStatsMetricPublisher genericStatsMetricPublisher
     ) {
         super(metadata, namedXContentRegistry, clusterService, recoverySettings, buildLocation(metadata));
         this.service = service;
@@ -312,8 +394,12 @@ class S3Repository extends MeteredBlobStoreRepository {
         this.multipartUploadEnabled = multipartUploadEnabled;
         this.pluginConfigPath = pluginConfigPath;
         this.asyncUploadUtils = asyncUploadUtils;
+        this.urgentExecutorBuilder = urgentExecutorBuilder;
         this.priorityExecutorBuilder = priorityExecutorBuilder;
         this.normalExecutorBuilder = normalExecutorBuilder;
+        this.normalPrioritySizeBasedBlockingQ = normalPrioritySizeBasedBlockingQ;
+        this.lowPrioritySizeBasedBlockingQ = lowPrioritySizeBasedBlockingQ;
+        this.genericStatsMetricPublisher = genericStatsMetricPublisher;
 
         validateRepositoryMetadata(metadata);
         readRepositoryMetadata();
@@ -339,6 +425,7 @@ class S3Repository extends MeteredBlobStoreRepository {
         SnapshotInfo snapshotInfo,
         Version repositoryMetaVersion,
         Function<ClusterState, ClusterState> stateTransformer,
+        Priority repositoryUpdatePriority,
         ActionListener<RepositoryData> listener
     ) {
         if (SnapshotsService.useShardGenerations(repositoryMetaVersion) == false) {
@@ -351,6 +438,7 @@ class S3Repository extends MeteredBlobStoreRepository {
             snapshotInfo,
             repositoryMetaVersion,
             stateTransformer,
+            repositoryUpdatePriority,
             listener
         );
     }
@@ -426,10 +514,15 @@ class S3Repository extends MeteredBlobStoreRepository {
             bufferSize,
             cannedACL,
             storageClass,
+            bulkDeletesSize,
             metadata,
             asyncUploadUtils,
+            urgentExecutorBuilder,
             priorityExecutorBuilder,
-            normalExecutorBuilder
+            normalExecutorBuilder,
+            normalPrioritySizeBasedBlockingQ,
+            lowPrioritySizeBasedBlockingQ,
+            genericStatsMetricPublisher
         );
     }
 
@@ -461,7 +554,9 @@ class S3Repository extends MeteredBlobStoreRepository {
 
         // Reload configs for S3RepositoryPlugin
         service.settings(metadata);
+        service.releaseCachedClients();
         s3AsyncService.settings(metadata);
+        s3AsyncService.releaseCachedClients();
 
         // Reload configs for S3BlobStore
         BlobStore blobStore = getBlobStore();
@@ -485,6 +580,7 @@ class S3Repository extends MeteredBlobStoreRepository {
         this.serverSideEncryption = SERVER_SIDE_ENCRYPTION_SETTING.get(metadata.settings());
         this.storageClass = STORAGE_CLASS_SETTING.get(metadata.settings());
         this.cannedACL = CANNED_ACL_SETTING.get(metadata.settings());
+        this.bulkDeletesSize = BULK_DELETE_SIZE.get(metadata.settings());
         if (S3ClientSettings.checkDeprecatedCredentials(metadata.settings())) {
             // provided repository settings
             deprecationLogger.deprecate(

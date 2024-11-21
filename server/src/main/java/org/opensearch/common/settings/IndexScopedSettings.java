@@ -38,6 +38,7 @@ import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.cluster.routing.allocation.decider.EnableAllocationDecider;
 import org.opensearch.cluster.routing.allocation.decider.MaxRetryAllocationDecider;
 import org.opensearch.cluster.routing.allocation.decider.ShardsLimitAllocationDecider;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.util.FeatureFlags;
@@ -51,6 +52,7 @@ import org.opensearch.index.MergeSchedulerConfig;
 import org.opensearch.index.SearchSlowLog;
 import org.opensearch.index.TieredMergePolicyProvider;
 import org.opensearch.index.cache.bitset.BitsetFilterCache;
+import org.opensearch.index.compositeindex.datacube.startree.StarTreeIndexSettings;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.fielddata.IndexFieldDataService;
 import org.opensearch.index.mapper.FieldMapper;
@@ -72,8 +74,9 @@ import java.util.function.Predicate;
  * Encapsulates all valid index level settings.
  * @see Property#IndexScope
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public final class IndexScopedSettings extends AbstractScopedSettings {
 
     public static final Predicate<String> INDEX_SETTINGS_KEY_PREDICATE = (s) -> s.startsWith(IndexMetadata.INDEX_SETTING_PREFIX);
@@ -148,6 +151,7 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 IndexSettings.MAX_ADJACENCY_MATRIX_FILTERS_SETTING,
                 IndexSettings.MAX_ANALYZED_OFFSET_SETTING,
                 IndexSettings.MAX_TERMS_COUNT_SETTING,
+                IndexSettings.MAX_NESTED_QUERY_DEPTH_SETTING,
                 IndexSettings.INDEX_TRANSLOG_SYNC_INTERVAL_SETTING,
                 IndexSettings.DEFAULT_FIELD_SETTING,
                 IndexSettings.QUERY_STRING_LENIENT_SETTING,
@@ -196,6 +200,7 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 EngineConfig.INDEX_CODEC_SETTING,
                 EngineConfig.INDEX_CODEC_COMPRESSION_LEVEL_SETTING,
                 EngineConfig.INDEX_OPTIMIZE_AUTO_GENERATED_IDS,
+                EngineConfig.INDEX_USE_COMPOUND_FILE,
                 IndexMetadata.SETTING_WAIT_FOR_ACTIVE_SHARDS,
                 IndexSettings.DEFAULT_PIPELINE,
                 IndexSettings.FINAL_PIPELINE,
@@ -205,6 +210,7 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 IndexSettings.INDEX_MERGE_ON_FLUSH_MAX_FULL_FLUSH_MERGE_WAIT_TIME,
                 IndexSettings.INDEX_MERGE_ON_FLUSH_POLICY,
                 IndexSettings.INDEX_MERGE_POLICY,
+                IndexSettings.INDEX_CHECK_PENDING_FLUSH_ENABLED,
                 LogByteSizeMergePolicyProvider.INDEX_LBS_MERGE_POLICY_MERGE_FACTOR_SETTING,
                 LogByteSizeMergePolicyProvider.INDEX_LBS_MERGE_POLICY_MIN_MERGE_SETTING,
                 LogByteSizeMergePolicyProvider.INDEX_LBS_MAX_MERGE_SEGMENT_SETTING,
@@ -218,14 +224,38 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 IndexSettings.SEARCHABLE_SNAPSHOT_INDEX_ID,
                 IndexSettings.SEARCHABLE_SNAPSHOT_ID_NAME,
                 IndexSettings.SEARCHABLE_SNAPSHOT_ID_UUID,
+                IndexSettings.SEARCHABLE_SNAPSHOT_SHARD_PATH_TYPE,
 
                 // Settings for remote translog
                 IndexSettings.INDEX_REMOTE_TRANSLOG_BUFFER_INTERVAL_SETTING,
+                IndexSettings.INDEX_REMOTE_TRANSLOG_KEEP_EXTRA_GEN_SETTING,
 
                 // Settings for remote store enablement
                 IndexMetadata.INDEX_REMOTE_STORE_ENABLED_SETTING,
                 IndexMetadata.INDEX_REMOTE_SEGMENT_STORE_REPOSITORY_SETTING,
                 IndexMetadata.INDEX_REMOTE_TRANSLOG_REPOSITORY_SETTING,
+
+                IndexSettings.INDEX_DOC_ID_FUZZY_SET_ENABLED_SETTING,
+                IndexSettings.INDEX_DOC_ID_FUZZY_SET_FALSE_POSITIVE_PROBABILITY_SETTING,
+
+                // Settings for concurrent segment search
+                IndexSettings.INDEX_CONCURRENT_SEGMENT_SEARCH_SETTING, // deprecated
+                IndexSettings.INDEX_CONCURRENT_SEGMENT_SEARCH_MODE,
+                IndexSettings.INDEX_CONCURRENT_SEGMENT_SEARCH_MAX_SLICE_COUNT,
+                IndexSettings.ALLOW_DERIVED_FIELDS,
+
+                // Settings for star tree index
+                StarTreeIndexSettings.STAR_TREE_DEFAULT_MAX_LEAF_DOCS,
+                StarTreeIndexSettings.STAR_TREE_MAX_DIMENSIONS_SETTING,
+                StarTreeIndexSettings.STAR_TREE_MAX_FIELDS_SETTING,
+                StarTreeIndexSettings.DEFAULT_METRICS_LIST,
+                StarTreeIndexSettings.DEFAULT_DATE_INTERVALS,
+                StarTreeIndexSettings.STAR_TREE_MAX_DATE_INTERVALS_SETTING,
+                StarTreeIndexSettings.STAR_TREE_MAX_BASE_METRICS_SETTING,
+                StarTreeIndexSettings.IS_COMPOSITE_INDEX_SETTING,
+
+                IndexSettings.INDEX_CONTEXT_CREATED_VERSION,
+                IndexSettings.INDEX_CONTEXT_CURRENT_VERSION,
 
                 // validate that built-in similarities don't get redefined
                 Setting.groupSetting("index.similarity.", (s) -> {
@@ -250,8 +280,10 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
      * setting should be moved to {@link #BUILT_IN_INDEX_SETTINGS}.
      */
     public static final Map<String, List<Setting>> FEATURE_FLAGGED_INDEX_SETTINGS = Map.of(
-        FeatureFlags.CONCURRENT_SEGMENT_SEARCH,
-        List.of(IndexSettings.INDEX_CONCURRENT_SEGMENT_SEARCH_SETTING)
+        FeatureFlags.TIERED_REMOTE_INDEX,
+        List.of(IndexModule.INDEX_STORE_LOCALITY_SETTING, IndexModule.INDEX_TIERING_STATE),
+        FeatureFlags.READER_WRITER_SPLIT_EXPERIMENTAL,
+        List.of(IndexMetadata.INDEX_NUMBER_OF_SEARCH_REPLICAS_SETTING)
     );
 
     public static final IndexScopedSettings DEFAULT_SCOPED_SETTINGS = new IndexScopedSettings(Settings.EMPTY, BUILT_IN_INDEX_SETTINGS);

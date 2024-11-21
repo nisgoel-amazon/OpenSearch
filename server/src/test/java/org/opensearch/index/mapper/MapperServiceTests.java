@@ -36,6 +36,7 @@ import org.apache.lucene.analysis.TokenStream;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentContraints;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -51,6 +52,7 @@ import org.opensearch.index.analysis.TokenFilterFactory;
 import org.opensearch.index.mapper.KeywordFieldMapper.KeywordFieldType;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 import org.opensearch.index.mapper.NumberFieldMapper.NumberFieldType;
+import org.opensearch.indices.IndicesModule;
 import org.opensearch.indices.InvalidTypeNameException;
 import org.opensearch.indices.analysis.AnalysisModule.AnalysisProvider;
 import org.opensearch.plugins.AnalysisPlugin;
@@ -84,6 +86,11 @@ public class MapperServiceTests extends OpenSearchSingleNodeTestCase {
         assertEquals("mapping type name [_document] can't start with '_' unless it is called [_doc]", e.getMessage());
 
         MapperService.validateTypeName("_doc"); // no exception
+    }
+
+    public void testGetMetadataFieldsReturnsExpectedSet() throws Throwable {
+        final MapperService mapperService = createIndex("test1").mapperService();
+        assertEquals(mapperService.getMetadataFields(), IndicesModule.getBuiltInMetadataFields());
     }
 
     public void testPreflightUpdateDoesNotChangeMapping() throws Throwable {
@@ -156,6 +163,13 @@ public class MapperServiceTests extends OpenSearchSingleNodeTestCase {
             () -> indexService1.mapperService().merge("type", objectMapping, updateOrPreflight())
         );
         assertThat(e.getMessage(), containsString("Limit of mapping depth [1] has been exceeded"));
+    }
+
+    public void testMappingDepthXContentLimit() throws Throwable {
+        createIndex(
+            "test1",
+            Settings.builder().put(MapperService.INDEX_MAPPING_DEPTH_LIMIT_SETTING.getKey(), XContentContraints.DEFAULT_MAX_DEPTH).build()
+        );
     }
 
     public void testUnmappedFieldType() {
@@ -298,6 +312,15 @@ public class MapperServiceTests extends OpenSearchSingleNodeTestCase {
             ).mapperService().merge("type", new CompressedXContent(mapping), updateOrPreflight());
         });
         assertEquals("Limit of total fields [" + numberOfNonAliasFields + "] has been exceeded", e.getMessage());
+    }
+
+    public void testFieldNameLengthXContentLimit() throws Throwable {
+        createIndex(
+            "test1",
+            Settings.builder()
+                .put(MapperService.INDEX_MAPPING_FIELD_NAME_LENGTH_LIMIT_SETTING.getKey(), XContentContraints.DEFAULT_MAX_NAME_LEN)
+                .build()
+        );
     }
 
     public void testFieldNameLengthLimit() throws Throwable {

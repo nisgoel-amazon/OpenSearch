@@ -51,6 +51,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterApplierService;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Priority;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
@@ -61,6 +62,7 @@ import org.opensearch.common.crypto.MasterKeyProvider;
 import org.opensearch.common.io.InputStreamContainer;
 import org.opensearch.common.lifecycle.Lifecycle;
 import org.opensearch.common.lifecycle.LifecycleListener;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
@@ -147,6 +149,10 @@ public class RepositoriesServiceTests extends OpenSearchTestCase {
         when(currentClusterState.getNodes()).thenReturn(nodes);
         when(clusterService.state()).thenReturn(currentClusterState);
 
+        when(clusterService.getSettings()).thenReturn(Settings.EMPTY);
+        ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+        when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
+
         RepositoriesService repositoriesService = new RepositoriesService(
             Settings.EMPTY,
             clusterService,
@@ -219,20 +225,17 @@ public class RepositoriesServiceTests extends OpenSearchTestCase {
         assertThat(repositoriesService.repositoriesStats().size(), equalTo(1));
 
         repositoriesService.applyClusterState(new ClusterChangedEvent("new repo", emptyState(), clusterStateWithRepoTypeA));
-        assertThat(repositoriesService.repositoriesStats().size(), equalTo(1));
+        assertThat(repositoriesService.repositoriesStats().size(), equalTo(0));
 
         ClusterState clusterStateWithRepoTypeB = createClusterStateWithRepo(repoName, MeteredRepositoryTypeB.TYPE);
         repositoriesService.applyClusterState(new ClusterChangedEvent("new repo", clusterStateWithRepoTypeB, emptyState()));
 
         List<RepositoryStatsSnapshot> repositoriesStats = repositoriesService.repositoriesStats();
-        assertThat(repositoriesStats.size(), equalTo(2));
+        assertThat(repositoriesStats.size(), equalTo(1));
         RepositoryStatsSnapshot repositoryStatsTypeA = repositoriesStats.get(0);
-        assertThat(repositoryStatsTypeA.getRepositoryInfo().type, equalTo(MeteredRepositoryTypeA.TYPE));
-        assertThat(repositoryStatsTypeA.getRepositoryStats(), equalTo(MeteredRepositoryTypeA.STATS));
+        assertThat(repositoryStatsTypeA.getRepositoryInfo().type, equalTo(MeteredRepositoryTypeB.TYPE));
+        assertThat(repositoryStatsTypeA.getRepositoryStats(), equalTo(MeteredRepositoryTypeB.STATS));
 
-        RepositoryStatsSnapshot repositoryStatsTypeB = repositoriesStats.get(1);
-        assertThat(repositoryStatsTypeB.getRepositoryInfo().type, equalTo(MeteredRepositoryTypeB.TYPE));
-        assertThat(repositoryStatsTypeB.getRepositoryStats(), equalTo(MeteredRepositoryTypeB.STATS));
     }
 
     public void testWithSameKeyProviderNames() {
@@ -258,7 +261,7 @@ public class RepositoriesServiceTests extends OpenSearchTestCase {
             kpTypeA
         );
         repositoriesService.applyClusterState(new ClusterChangedEvent("new repo", clusterStateWithRepoTypeB, emptyState()));
-        assertThat(repositoriesService.repositoriesStats().size(), equalTo(2));
+        assertThat(repositoriesService.repositoriesStats().size(), equalTo(1));
         MeteredRepositoryTypeB repositoryB = (MeteredRepositoryTypeB) repositoriesService.repository("repoName");
         assertNotNull(repositoryB);
         assertNotNull(repository.cryptoHandler);
@@ -677,6 +680,20 @@ public class RepositoriesServiceTests extends OpenSearchTestCase {
             SnapshotInfo snapshotInfo,
             Version repositoryMetaVersion,
             Function<ClusterState, ClusterState> stateTransformer,
+            ActionListener<RepositoryData> listener
+        ) {
+            listener.onResponse(null);
+        }
+
+        @Override
+        public void finalizeSnapshot(
+            ShardGenerations shardGenerations,
+            long repositoryStateId,
+            Metadata clusterMetadata,
+            SnapshotInfo snapshotInfo,
+            Version repositoryMetaVersion,
+            Function<ClusterState, ClusterState> stateTransformer,
+            Priority repositoryUpdatePriority,
             ActionListener<RepositoryData> listener
         ) {
             listener.onResponse(null);

@@ -34,6 +34,7 @@ package org.opensearch.index.shard;
 
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.util.set.Sets;
 
 import java.util.ArrayList;
@@ -43,8 +44,9 @@ import java.util.Set;
 /**
  * Replication group for a shard. Used by a primary shard to coordinate replication and recoveries.
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class ReplicationGroup {
     private final IndexShardRoutingTable routingTable;
     private final Set<String> inSyncAllocationIds;
@@ -70,7 +72,8 @@ public class ReplicationGroup {
         this.replicationTargets = new ArrayList<>();
         this.skippedShards = new ArrayList<>();
         for (final ShardRouting shard : routingTable) {
-            if (shard.unassigned()) {
+            // search only replicas never receive any replicated operations
+            if (shard.unassigned() || shard.isSearchOnly()) {
                 assert shard.primary() == false : "primary shard should not be unassigned in a replication group: " + shard;
                 skippedShards.add(shard);
             } else {

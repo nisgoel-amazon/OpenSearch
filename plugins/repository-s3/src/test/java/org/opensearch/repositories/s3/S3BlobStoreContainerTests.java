@@ -90,6 +90,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -125,7 +126,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeSingleUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize)
+            () -> blobContainer.executeSingleUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null)
         );
         assertEquals("Upload request size [" + blobSize + "] can't be larger than 5gb", e.getMessage());
     }
@@ -139,7 +140,13 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeSingleUpload(blobStore, blobName, new ByteArrayInputStream(new byte[0]), ByteSizeUnit.MB.toBytes(2))
+            () -> blobContainer.executeSingleUpload(
+                blobStore,
+                blobName,
+                new ByteArrayInputStream(new byte[0]),
+                ByteSizeUnit.MB.toBytes(2),
+                null
+            )
         );
         assertEquals("Upload request size [2097152] can't be larger than buffer size", e.getMessage());
     }
@@ -276,10 +283,12 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         final String bucketName = randomAlphaOfLengthBetween(1, 10);
 
         final BlobPath blobPath = new BlobPath();
+        int bulkDeleteSize = 5;
 
         final S3BlobStore blobStore = mock(S3BlobStore.class);
         when(blobStore.bucket()).thenReturn(bucketName);
         when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+        when(blobStore.getBulkDeletesSize()).thenReturn(bulkDeleteSize);
 
         final S3Client client = mock(S3Client.class);
         doAnswer(invocation -> new AmazonS3Reference(client)).when(blobStore).clientReference();
@@ -297,8 +306,11 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         when(client.listObjectsV2Paginator(any(ListObjectsV2Request.class))).thenReturn(listObjectsV2Iterable);
 
         final List<String> keysDeleted = new ArrayList<>();
+        AtomicInteger deleteCount = new AtomicInteger();
         doAnswer(invocation -> {
             DeleteObjectsRequest deleteObjectsRequest = invocation.getArgument(0);
+            deleteCount.getAndIncrement();
+            logger.info("Object sizes are{}", deleteObjectsRequest.delete().objects().size());
             keysDeleted.addAll(deleteObjectsRequest.delete().objects().stream().map(ObjectIdentifier::key).collect(Collectors.toList()));
             return DeleteObjectsResponse.builder().build();
         }).when(client).deleteObjects(any(DeleteObjectsRequest.class));
@@ -311,6 +323,8 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         // keysDeleted will have blobPath also
         assertEquals(listObjectsV2ResponseIterator.getKeysListed().size(), keysDeleted.size() - 1);
         assertTrue(keysDeleted.contains(blobPath.buildAsString()));
+        // keysDeleted will have blobPath also
+        assertEquals((int) Math.ceil(((double) keysDeleted.size() + 1) / bulkDeleteSize), deleteCount.get());
         keysDeleted.remove(blobPath.buildAsString());
         assertEquals(new HashSet<>(listObjectsV2ResponseIterator.getKeysListed()), new HashSet<>(keysDeleted));
     }
@@ -423,6 +437,10 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         final String bucketName = randomAlphaOfLengthBetween(1, 10);
         final String blobName = randomAlphaOfLengthBetween(1, 10);
 
+        final Map<String, String> metadata = new HashMap<>();
+        metadata.put("key1", "value1");
+        metadata.put("key2", "value2");
+
         final BlobPath blobPath = new BlobPath();
         if (randomBoolean()) {
             IntStream.of(randomIntBetween(1, 5)).forEach(value -> blobPath.add("path_" + value));
@@ -460,7 +478,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         );
 
         final ByteArrayInputStream inputStream = new ByteArrayInputStream(new byte[blobSize]);
-        blobContainer.executeSingleUpload(blobStore, blobName, inputStream, blobSize);
+        blobContainer.executeSingleUpload(blobStore, blobName, inputStream, blobSize, metadata);
 
         final PutObjectRequest request = putObjectRequestArgumentCaptor.getValue();
         final RequestBody requestBody = requestBodyArgumentCaptor.getValue();
@@ -473,6 +491,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         assertEquals(blobSize, request.contentLength().longValue());
         assertEquals(storageClass, request.storageClass());
         assertEquals(cannedAccessControlList, request.acl());
+        assertEquals(metadata, request.metadata());
         if (serverSideEncryption) {
             assertEquals(ServerSideEncryption.AES256, request.serverSideEncryption());
         }
@@ -485,7 +504,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize)
+            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null)
         );
         assertEquals("Multipart upload request size [" + blobSize + "] can't be larger than 5tb", e.getMessage());
     }
@@ -497,7 +516,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize)
+            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null)
         );
         assertEquals("Multipart upload request size [" + blobSize + "] can't be smaller than 5mb", e.getMessage());
     }
@@ -505,6 +524,10 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
     public void testExecuteMultipartUpload() throws IOException {
         final String bucketName = randomAlphaOfLengthBetween(1, 10);
         final String blobName = randomAlphaOfLengthBetween(1, 10);
+
+        final Map<String, String> metadata = new HashMap<>();
+        metadata.put("key1", "value1");
+        metadata.put("key2", "value2");
 
         final BlobPath blobPath = new BlobPath();
         if (randomBoolean()) {
@@ -570,13 +593,15 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final ByteArrayInputStream inputStream = new ByteArrayInputStream(new byte[0]);
         final S3BlobContainer blobContainer = new S3BlobContainer(blobPath, blobStore);
-        blobContainer.executeMultipartUpload(blobStore, blobName, inputStream, blobSize);
+        blobContainer.executeMultipartUpload(blobStore, blobName, inputStream, blobSize, metadata);
 
         final CreateMultipartUploadRequest initRequest = createMultipartUploadRequestArgumentCaptor.getValue();
         assertEquals(bucketName, initRequest.bucket());
         assertEquals(blobPath.buildAsString() + blobName, initRequest.key());
         assertEquals(storageClass, initRequest.storageClass());
         assertEquals(cannedAccessControlList, initRequest.acl());
+        assertEquals(metadata, initRequest.metadata());
+
         if (serverSideEncryption) {
             assertEquals(ServerSideEncryption.AES256, initRequest.serverSideEncryption());
         }
@@ -679,7 +704,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IOException e = expectThrows(IOException.class, () -> {
             final S3BlobContainer blobContainer = new S3BlobContainer(blobPath, blobStore);
-            blobContainer.executeMultipartUpload(blobStore, blobName, new ByteArrayInputStream(new byte[0]), blobSize);
+            blobContainer.executeMultipartUpload(blobStore, blobName, new ByteArrayInputStream(new byte[0]), blobSize, null);
         });
 
         assertEquals("Unable to upload object [" + blobName + "] using multipart upload", e.getMessage());
@@ -909,6 +934,15 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         testListBlobsByPrefixInLexicographicOrder(2, 1, BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC);
     }
 
+    /**
+     * Test the boundary value at page size to ensure
+     * unnecessary calls are not made to S3 by fetching the next page.
+     * @throws IOException
+     */
+    public void testListBlobsByPrefixInLexicographicOrderWithLimitEqualToPageSize() throws IOException {
+        testListBlobsByPrefixInLexicographicOrder(5, 1, BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC);
+    }
+
     public void testListBlobsByPrefixInLexicographicOrderWithLimitGreaterThanPageSize() throws IOException {
         testListBlobsByPrefixInLexicographicOrder(8, 2, BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC);
     }
@@ -928,7 +962,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final S3AsyncClient s3AsyncClient = mock(S3AsyncClient.class);
         final AmazonAsyncS3Reference amazonAsyncS3Reference = new AmazonAsyncS3Reference(
-            AmazonAsyncS3WithCredentials.create(s3AsyncClient, s3AsyncClient, null)
+            AmazonAsyncS3WithCredentials.create(s3AsyncClient, s3AsyncClient, s3AsyncClient, null)
         );
 
         final S3BlobStore blobStore = mock(S3BlobStore.class);
@@ -986,7 +1020,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final S3AsyncClient s3AsyncClient = mock(S3AsyncClient.class);
         final AmazonAsyncS3Reference amazonAsyncS3Reference = new AmazonAsyncS3Reference(
-            AmazonAsyncS3WithCredentials.create(s3AsyncClient, s3AsyncClient, null)
+            AmazonAsyncS3WithCredentials.create(s3AsyncClient, s3AsyncClient, s3AsyncClient, null)
         );
         final S3BlobStore blobStore = mock(S3BlobStore.class);
         final BlobPath blobPath = new BlobPath();
@@ -1041,7 +1075,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final S3AsyncClient s3AsyncClient = mock(S3AsyncClient.class);
         final AmazonAsyncS3Reference amazonAsyncS3Reference = new AmazonAsyncS3Reference(
-            AmazonAsyncS3WithCredentials.create(s3AsyncClient, s3AsyncClient, null)
+            AmazonAsyncS3WithCredentials.create(s3AsyncClient, s3AsyncClient, s3AsyncClient, null)
         );
 
         final S3BlobStore blobStore = mock(S3BlobStore.class);
@@ -1084,7 +1118,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final S3AsyncClient s3AsyncClient = mock(S3AsyncClient.class);
         final AmazonAsyncS3Reference amazonAsyncS3Reference = new AmazonAsyncS3Reference(
-            AmazonAsyncS3WithCredentials.create(s3AsyncClient, s3AsyncClient, null)
+            AmazonAsyncS3WithCredentials.create(s3AsyncClient, s3AsyncClient, s3AsyncClient, null)
         );
 
         final S3BlobStore blobStore = mock(S3BlobStore.class);

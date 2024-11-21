@@ -285,7 +285,7 @@ public class ReadOnlyEngine extends Engine {
                     config.getGlobalCheckpointSupplier(),
                     config.getPrimaryTermSupplier(),
                     seqNo -> {},
-                    config.getPrimaryModeSupplier()
+                    config.getStartedPrimarySupplier()
                 )
         ) {
             return translog.stats();
@@ -522,7 +522,7 @@ public class ReadOnlyEngine extends Engine {
     }
 
     @Override
-    public void rollTranslogGeneration() {
+    public void rollTranslogGeneration() throws IOException {
         translogManager.rollTranslogGeneration();
     }
 

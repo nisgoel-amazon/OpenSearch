@@ -256,7 +256,7 @@ public abstract class AbstractScopedSettings {
     /**
      * Adds a settings consumer that is only executed if any setting in the supplied list of settings is changed. In that case all the
      * settings are specified in the argument are returned.
-     *
+     * <p>
      * Also automatically adds empty consumers for all settings in order to activate logging
      */
     public synchronized void addSettingsUpdateConsumer(Consumer<Settings> consumer, List<? extends Setting<?>> settings) {
@@ -267,7 +267,7 @@ public abstract class AbstractScopedSettings {
      * Adds a settings consumer that is only executed if any setting in the supplied list of settings is changed. In that case all the
      * settings are specified in the argument are returned.  The validator is run across all specified settings before the settings are
      * applied.
-     *
+     * <p>
      * Also automatically adds empty consumers for all settings in order to activate logging
      */
     public synchronized void addSettingsUpdateConsumer(
@@ -790,6 +790,36 @@ public abstract class AbstractScopedSettings {
             throw new IllegalArgumentException("setting " + setting.getKey() + " has not been registered");
         }
         return setting.get(this.lastSettingsApplied, settings);
+    }
+
+    /**
+     * Returns the value for the given setting if it is explicitly set,
+     * otherwise will return null instead of default value
+     **/
+    public <T> T getOrNull(Setting<T> setting) {
+        if (setting.getProperties().contains(scope) == false) {
+            throw new SettingsException(
+                "settings scope doesn't match the setting scope [" + this.scope + "] not in [" + setting.getProperties() + "]"
+            );
+        }
+        if (get(setting.getKey()) == null) {
+            throw new SettingsException("setting " + setting.getKey() + " has not been registered");
+        }
+        if (setting.exists(lastSettingsApplied)) {
+            return setting.get(lastSettingsApplied);
+        }
+        if (setting.exists(settings)) {
+            return setting.get(settings);
+        }
+        if (setting.fallbackSetting != null) {
+            if (setting.fallbackSetting.exists(lastSettingsApplied)) {
+                return setting.fallbackSetting.get(lastSettingsApplied);
+            }
+            if (setting.fallbackSetting.exists(settings)) {
+                return setting.fallbackSetting.get(settings);
+            }
+        }
+        return null;
     }
 
     /**

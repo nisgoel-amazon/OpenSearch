@@ -13,6 +13,7 @@ import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.SoftDeletesDirectoryReaderWrapper;
 import org.apache.lucene.search.ReferenceManager;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.index.OpenSearchDirectoryReader;
@@ -53,8 +54,9 @@ import static org.opensearch.index.seqno.SequenceNumbers.MAX_SEQ_NO;
  * is enabled.  This Engine does not create an IndexWriter, rather it refreshes a {@link NRTReplicationReaderManager}
  * with new Segments when received from an external source.
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class NRTReplicationEngine extends Engine implements LifecycleAware {
 
     private volatile SegmentInfos lastCommittedSegmentInfos;
@@ -125,7 +127,7 @@ public class NRTReplicationEngine extends Engine implements LifecycleAware {
                 },
                 this,
                 engineConfig.getTranslogFactory(),
-                engineConfig.getPrimaryModeSupplier()
+                engineConfig.getStartedPrimarySupplier()
             );
             this.translogManager = translogManagerRef;
             success = true;
@@ -181,7 +183,7 @@ public class NRTReplicationEngine extends Engine implements LifecycleAware {
 
     /**
      * Persist the latest live SegmentInfos.
-     *
+     * <p>
      * This method creates a commit point from the latest SegmentInfos.
      *
      * @throws IOException - When there is an IO error committing the SegmentInfos.
@@ -435,7 +437,7 @@ public class NRTReplicationEngine extends Engine implements LifecycleAware {
     }
 
     @Override
-    public void rollTranslogGeneration() throws EngineException {
+    public void rollTranslogGeneration() throws EngineException, IOException {
         translogManager.rollTranslogGeneration();
     }
 
@@ -486,7 +488,8 @@ public class NRTReplicationEngine extends Engine implements LifecycleAware {
                  This is not required for remote store implementations given on failover the replica re-syncs with the store
                  during promotion.
                  */
-                if (engineConfig.getIndexSettings().isRemoteStoreEnabled() == false) {
+                if (engineConfig.getIndexSettings().isRemoteStoreEnabled() == false
+                    && engineConfig.getIndexSettings().isAssignedOnRemoteNode() == false) {
                     latestSegmentInfos.counter = latestSegmentInfos.counter + SI_COUNTER_INCREMENT;
                     latestSegmentInfos.changed();
                 }

@@ -292,7 +292,7 @@ public class InternalEngine extends Engine {
                     new CompositeTranslogEventListener(Arrays.asList(internalTranslogEventListener, translogEventListener), shardId),
                     this::ensureOpen,
                     engineConfig.getTranslogFactory(),
-                    engineConfig.getPrimaryModeSupplier()
+                    engineConfig.getStartedPrimarySupplier()
                 );
                 this.translogManager = translogManagerRef;
                 this.softDeletesPolicy = newSoftDeletesPolicy();
@@ -402,7 +402,7 @@ public class InternalEngine extends Engine {
      * The main purpose for this is that if we have external refreshes happening we don't issue extra
      * refreshes to clear version map memory etc. this can cause excessive segment creation if heavy indexing
      * is happening and the refresh interval is low (ie. 1 sec)
-     *
+     * <p>
      * This also prevents segment starvation where an internal reader holds on to old segments literally forever
      * since no indexing is happening and refreshes are only happening to the external reader manager, while with
      * this specialized implementation an external refresh will immediately be reflected on the internal reader
@@ -801,7 +801,7 @@ public class InternalEngine extends Engine {
         final OpVsLuceneDocStatus status;
         VersionValue versionValue = getVersionFromMap(op.uid().bytes());
         assert incrementVersionLookup();
-        boolean segRepEnabled = engineConfig.getIndexSettings().isSegRepEnabled();
+        boolean segRepEnabled = engineConfig.getIndexSettings().isSegRepEnabledOrRemoteNode();
         if (versionValue != null) {
             status = compareOpToVersionMapOnSeqNo(op.id(), op.seqNo(), op.primaryTerm(), versionValue);
         } else {
@@ -1096,7 +1096,7 @@ public class InternalEngine extends Engine {
             assert maxSeqNoOfUpdatesOrDeletes < index.seqNo() : index.seqNo() + ">=" + maxSeqNoOfUpdatesOrDeletes;
             plan = IndexingStrategy.optimizedAppendOnly(index.version(), 0);
         } else {
-            boolean segRepEnabled = engineConfig.getIndexSettings().isSegRepEnabled();
+            boolean segRepEnabled = engineConfig.getIndexSettings().isSegRepEnabledOrRemoteNode();
             versionMap.enforceSafeAccess();
             final OpVsLuceneDocStatus opVsLucene = compareOpToLuceneDocBasedOnSeqNo(index);
             if (opVsLucene == OpVsLuceneDocStatus.OP_STALE_OR_EQUAL) {
@@ -1503,7 +1503,9 @@ public class InternalEngine extends Engine {
         final long totalDocs = indexWriter.getPendingNumDocs() + inFlightDocCount.addAndGet(addingDocs);
         if (totalDocs > maxDocs) {
             releaseInFlightDocs(addingDocs);
-            return new IllegalArgumentException("Number of documents in the index can't exceed [" + maxDocs + "]");
+            return new IllegalArgumentException(
+                "Number of documents in shard " + shardId + " exceeds the limit of [" + maxDocs + "] documents per shard"
+            );
         } else {
             return null;
         }
@@ -1541,7 +1543,7 @@ public class InternalEngine extends Engine {
             // See testRecoveryWithOutOfOrderDelete for an example of peer recovery
             plan = DeletionStrategy.processButSkipLucene(false, delete.version());
         } else {
-            boolean segRepEnabled = engineConfig.getIndexSettings().isSegRepEnabled();
+            boolean segRepEnabled = engineConfig.getIndexSettings().isSegRepEnabledOrRemoteNode();
             final OpVsLuceneDocStatus opVsLucene = compareOpToLuceneDocBasedOnSeqNo(delete);
             if (opVsLucene == OpVsLuceneDocStatus.OP_STALE_OR_EQUAL) {
                 if (segRepEnabled) {
@@ -1957,7 +1959,7 @@ public class InternalEngine extends Engine {
                         // only after the active reader is updated. This ensures that a flush does not wipe out a required commit point file
                         // while we are
                         // in refresh listeners.
-                        final GatedCloseable<IndexCommit> latestCommit = engineConfig.getIndexSettings().isSegRepEnabled()
+                        final GatedCloseable<IndexCommit> latestCommit = engineConfig.getIndexSettings().isSegRepEnabledOrRemoteNode()
                             ? acquireLastIndexCommit(false)
                             : null;
                         commitIndexWriter(indexWriter, translogManager.getTranslog());
@@ -2030,22 +2032,8 @@ public class InternalEngine extends Engine {
     }
 
     @Override
-    public void rollTranslogGeneration() throws EngineException {
-        try (ReleasableLock ignored = readLock.acquire()) {
-            ensureOpen();
-            translogManager().getTranslog().rollGeneration();
-            translogManager().getTranslog().trimUnreferencedReaders();
-        } catch (AlreadyClosedException e) {
-            failOnTragicEvent(e);
-            throw e;
-        } catch (Exception e) {
-            try {
-                failEngine("translog trimming failed", e);
-            } catch (Exception inner) {
-                e.addSuppressed(inner);
-            }
-            throw new EngineException(shardId, "failed to roll translog", e);
-        }
+    public void rollTranslogGeneration() throws EngineException, IOException {
+        translogManager().rollTranslogGeneration();
     }
 
     @Override
@@ -2485,11 +2473,12 @@ public class InternalEngine extends Engine {
             iwc.setMaxFullFlushMergeWaitMillis(0);
         }
 
+        iwc.setCheckPendingFlushUpdate(config().getIndexSettings().isCheckPendingFlushEnabled());
         iwc.setMergePolicy(new OpenSearchMergePolicy(mergePolicy));
         iwc.setSimilarity(engineConfig.getSimilarity());
         iwc.setRAMBufferSizeMB(engineConfig.getIndexingBufferSize().getMbFrac());
         iwc.setCodec(engineConfig.getCodec());
-        iwc.setUseCompoundFile(true); // always use compound on flush - reduces # of file-handles on refresh
+        iwc.setUseCompoundFile(engineConfig.useCompoundFile());
         if (config().getIndexSort() != null) {
             iwc.setIndexSort(config().getIndexSort());
         }

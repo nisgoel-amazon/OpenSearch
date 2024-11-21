@@ -62,6 +62,7 @@ import org.apache.lucene.tests.search.RandomApproximationQuery;
 import org.apache.lucene.tests.util.TestUtil;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.profile.ProfileResult;
@@ -81,6 +82,9 @@ import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -89,6 +93,10 @@ public class QueryProfilerTests extends OpenSearchTestCase {
     private IndexReader reader;
     private ContextIndexSearcher searcher;
     private ExecutorService executor;
+    private static final String MAX_PREFIX = "max_";
+    private static final String MIN_PREFIX = "min_";
+    private static final String AVG_PREFIX = "avg_";
+    private static final String TIMING_TYPE_COUNT_SUFFIX = "_count";
 
     @ParametersFactory
     public static Collection<Object[]> concurrency() {
@@ -121,6 +129,9 @@ public class QueryProfilerTests extends OpenSearchTestCase {
         SearchContext searchContext = mock(SearchContext.class);
         IndexShard indexShard = mock(IndexShard.class);
         when(searchContext.indexShard()).thenReturn(indexShard);
+        SearchOperationListener searchOperationListener = new SearchOperationListener() {
+        };
+        when(indexShard.getSearchOperationListener()).thenReturn(searchOperationListener);
         when(searchContext.bucketCollectorProcessor()).thenReturn(SearchContext.NO_OP_BUCKET_COLLECTOR_PROCESSOR);
         searcher = new ContextIndexSearcher(
             reader,
@@ -154,13 +165,16 @@ public class QueryProfilerTests extends OpenSearchTestCase {
     }
 
     public void testBasic() throws IOException {
-        QueryProfiler profiler = new QueryProfiler(executor != null);
+        QueryProfiler profiler = executor != null
+            ? new ConcurrentQueryProfiler(new ConcurrentQueryProfileTree())
+            : new QueryProfiler(new InternalQueryProfileTree());
         searcher.setProfiler(profiler);
         Query query = new TermQuery(new Term("foo", "bar"));
         searcher.search(query, 1);
         List<ProfileResult> results = profiler.getTree();
         assertEquals(1, results.size());
-        Map<String, Long> breakdown = results.get(0).getTimeBreakdown();
+        ProfileResult profileResult = results.get(0);
+        Map<String, Long> breakdown = profileResult.getTimeBreakdown();
         assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT.toString()), greaterThan(0L));
         assertThat(breakdown.get(QueryTimingType.BUILD_SCORER.toString()), greaterThan(0L));
         assertThat(breakdown.get(QueryTimingType.NEXT_DOC.toString()), greaterThan(0L));
@@ -168,25 +182,68 @@ public class QueryProfilerTests extends OpenSearchTestCase {
         assertThat(breakdown.get(QueryTimingType.SCORE.toString()), greaterThan(0L));
         assertThat(breakdown.get(QueryTimingType.MATCH.toString()), equalTo(0L));
 
-        assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.BUILD_SCORER.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.NEXT_DOC.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.ADVANCE.toString() + "_count"), equalTo(0L));
-        assertThat(breakdown.get(QueryTimingType.SCORE.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.MATCH.toString() + "_count"), equalTo(0L));
+        assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+        assertThat(breakdown.get(QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+
+        if (executor != null) {
+            assertThat(profileResult.getMaxSliceTime(), is(not(nullValue())));
+            assertThat(profileResult.getMinSliceTime(), is(not(nullValue())));
+            assertThat(profileResult.getAvgSliceTime(), is(not(nullValue())));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.SCORE), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.SCORE), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.SCORE), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.MATCH), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.MATCH), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.MATCH), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+        } else {
+            assertThat(profileResult.getMaxSliceTime(), is(nullValue()));
+            assertThat(profileResult.getMinSliceTime(), is(nullValue()));
+            assertThat(profileResult.getAvgSliceTime(), is(nullValue()));
+        }
 
         long rewriteTime = profiler.getRewriteTime();
         assertThat(rewriteTime, greaterThan(0L));
     }
 
     public void testNoScoring() throws IOException {
-        QueryProfiler profiler = new QueryProfiler(executor != null);
+        QueryProfiler profiler = executor != null
+            ? new ConcurrentQueryProfiler(new ConcurrentQueryProfileTree())
+            : new QueryProfiler(new InternalQueryProfileTree());
         searcher.setProfiler(profiler);
         Query query = new TermQuery(new Term("foo", "bar"));
         searcher.search(query, 1, Sort.INDEXORDER); // scores are not needed
         List<ProfileResult> results = profiler.getTree();
         assertEquals(1, results.size());
-        Map<String, Long> breakdown = results.get(0).getTimeBreakdown();
+        ProfileResult profileResult = results.get(0);
+        Map<String, Long> breakdown = profileResult.getTimeBreakdown();
         assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT.toString()), greaterThan(0L));
         assertThat(breakdown.get(QueryTimingType.BUILD_SCORER.toString()), greaterThan(0L));
         assertThat(breakdown.get(QueryTimingType.NEXT_DOC.toString()), greaterThan(0L));
@@ -194,19 +251,61 @@ public class QueryProfilerTests extends OpenSearchTestCase {
         assertThat(breakdown.get(QueryTimingType.SCORE.toString()), equalTo(0L));
         assertThat(breakdown.get(QueryTimingType.MATCH.toString()), equalTo(0L));
 
-        assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.BUILD_SCORER.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.NEXT_DOC.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.ADVANCE.toString() + "_count"), equalTo(0L));
-        assertThat(breakdown.get(QueryTimingType.SCORE.toString() + "_count"), equalTo(0L));
-        assertThat(breakdown.get(QueryTimingType.MATCH.toString() + "_count"), equalTo(0L));
+        assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+        assertThat(breakdown.get(QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+        assertThat(breakdown.get(QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+
+        if (executor != null) {
+            assertThat(profileResult.getMaxSliceTime(), is(not(nullValue())));
+            assertThat(profileResult.getMinSliceTime(), is(not(nullValue())));
+            assertThat(profileResult.getAvgSliceTime(), is(not(nullValue())));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.SCORE), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.SCORE), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.SCORE), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.MATCH), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.MATCH), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.MATCH), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+        } else {
+            assertThat(profileResult.getMaxSliceTime(), is(nullValue()));
+            assertThat(profileResult.getMinSliceTime(), is(nullValue()));
+            assertThat(profileResult.getAvgSliceTime(), is(nullValue()));
+        }
 
         long rewriteTime = profiler.getRewriteTime();
         assertThat(rewriteTime, greaterThan(0L));
     }
 
     public void testUseIndexStats() throws IOException {
-        QueryProfiler profiler = new QueryProfiler(executor != null);
+        QueryProfiler profiler = executor != null
+            ? new ConcurrentQueryProfiler(new ConcurrentQueryProfileTree())
+            : new QueryProfiler(new InternalQueryProfileTree());
         searcher.setProfiler(profiler);
         Query query = new TermQuery(new Term("foo", "bar"));
         searcher.count(query); // will use index stats
@@ -220,13 +319,16 @@ public class QueryProfilerTests extends OpenSearchTestCase {
     }
 
     public void testApproximations() throws IOException {
-        QueryProfiler profiler = new QueryProfiler(executor != null);
+        QueryProfiler profiler = executor != null
+            ? new ConcurrentQueryProfiler(new ConcurrentQueryProfileTree())
+            : new QueryProfiler(new InternalQueryProfileTree());
         searcher.setProfiler(profiler);
         Query query = new RandomApproximationQuery(new TermQuery(new Term("foo", "bar")), random());
         searcher.count(query);
         List<ProfileResult> results = profiler.getTree();
         assertEquals(1, results.size());
-        Map<String, Long> breakdown = results.get(0).getTimeBreakdown();
+        ProfileResult profileResult = results.get(0);
+        Map<String, Long> breakdown = profileResult.getTimeBreakdown();
         assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT.toString()), greaterThan(0L));
         assertThat(breakdown.get(QueryTimingType.BUILD_SCORER.toString()), greaterThan(0L));
         assertThat(breakdown.get(QueryTimingType.NEXT_DOC.toString()), greaterThan(0L));
@@ -234,12 +336,52 @@ public class QueryProfilerTests extends OpenSearchTestCase {
         assertThat(breakdown.get(QueryTimingType.SCORE.toString()), equalTo(0L));
         assertThat(breakdown.get(QueryTimingType.MATCH.toString()), greaterThan(0L));
 
-        assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.BUILD_SCORER.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.NEXT_DOC.toString() + "_count"), greaterThan(0L));
-        assertThat(breakdown.get(QueryTimingType.ADVANCE.toString() + "_count"), equalTo(0L));
-        assertThat(breakdown.get(QueryTimingType.SCORE.toString() + "_count"), equalTo(0L));
-        assertThat(breakdown.get(QueryTimingType.MATCH.toString() + "_count"), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.CREATE_WEIGHT + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        assertThat(breakdown.get(QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+        assertThat(breakdown.get(QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+        assertThat(breakdown.get(QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+
+        if (executor != null) {
+            assertThat(profileResult.getMaxSliceTime(), is(not(nullValue())));
+            assertThat(profileResult.getMinSliceTime(), is(not(nullValue())));
+            assertThat(profileResult.getAvgSliceTime(), is(not(nullValue())));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.BUILD_SCORER), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.NEXT_DOC), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.ADVANCE), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.SCORE), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.SCORE), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.SCORE), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.MATCH), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.MATCH), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.MATCH), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.BUILD_SCORER + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.NEXT_DOC + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.ADVANCE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.SCORE + TIMING_TYPE_COUNT_SUFFIX), equalTo(0L));
+            assertThat(breakdown.get(MAX_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(MIN_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+            assertThat(breakdown.get(AVG_PREFIX + QueryTimingType.MATCH + TIMING_TYPE_COUNT_SUFFIX), greaterThan(0L));
+        } else {
+            assertThat(profileResult.getMaxSliceTime(), is(nullValue()));
+            assertThat(profileResult.getMinSliceTime(), is(nullValue()));
+            assertThat(profileResult.getAvgSliceTime(), is(nullValue()));
+        }
 
         long rewriteTime = profiler.getRewriteTime();
         assertThat(rewriteTime, greaterThan(0L));

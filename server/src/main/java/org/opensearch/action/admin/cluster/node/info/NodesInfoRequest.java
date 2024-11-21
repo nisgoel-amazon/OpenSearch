@@ -34,6 +34,7 @@ package org.opensearch.action.admin.cluster.node.info;
 
 import org.opensearch.LegacyESVersion;
 import org.opensearch.action.support.nodes.BaseNodesRequest;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
@@ -48,8 +49,9 @@ import java.util.stream.Collectors;
 /**
  * A request to get node (cluster) level information.
  *
- * @opensearch.internal
+ * @opensearch.api
  */
+@PublicApi(since = "1.0.0")
 public class NodesInfoRequest extends BaseNodesRequest<NodesInfoRequest> {
 
     private Set<String> requestedMetrics = Metric.allMetrics();
@@ -86,7 +88,7 @@ public class NodesInfoRequest extends BaseNodesRequest<NodesInfoRequest> {
      * for all nodes will be returned.
      */
     public NodesInfoRequest(String... nodesIds) {
-        super(nodesIds);
+        super(false, nodesIds);
         all();
     }
 

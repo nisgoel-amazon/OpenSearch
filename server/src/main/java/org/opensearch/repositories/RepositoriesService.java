@@ -68,7 +68,9 @@ import org.opensearch.common.util.concurrent.ConcurrentCollections;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
+import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 import org.opensearch.repositories.blobstore.MeteredBlobStoreRepository;
+import org.opensearch.snapshots.SnapshotsService;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
@@ -84,6 +86,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.opensearch.repositories.blobstore.BlobStoreRepository.REMOTE_STORE_INDEX_SHALLOW_COPY;
+import static org.opensearch.repositories.blobstore.BlobStoreRepository.SHALLOW_SNAPSHOT_V2;
 import static org.opensearch.repositories.blobstore.BlobStoreRepository.SYSTEM_REPOSITORY_SETTING;
 
 /**
@@ -123,6 +126,7 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
     private final RepositoriesStatsArchive repositoriesStatsArchive;
     private final ClusterManagerTaskThrottler.ThrottlingKey putRepositoryTaskKey;
     private final ClusterManagerTaskThrottler.ThrottlingKey deleteRepositoryTaskKey;
+    private final Settings settings;
 
     public RepositoriesService(
         Settings settings,
@@ -132,6 +136,7 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
         Map<String, Repository.Factory> internalTypesRegistry,
         ThreadPool threadPool
     ) {
+        this.settings = settings;
         this.typesRegistry = typesRegistry;
         this.internalTypesRegistry = internalTypesRegistry;
         this.clusterService = clusterService;
@@ -173,7 +178,7 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
             CryptoMetadata.fromRequest(request.cryptoSettings())
         );
         validate(request.name());
-        validateRepositoryMetadataSettings(clusterService, request.name(), request.settings());
+        validateRepositoryMetadataSettings(clusterService, request.name(), request.settings(), repositories, settings, this);
         if (newRepositoryMetadata.cryptoMetadata() != null) {
             validate(newRepositoryMetadata.cryptoMetadata().keyProviderName());
         }
@@ -457,7 +462,6 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
                     logger.debug("unregistering repository [{}]", entry.getKey());
                     Repository repository = entry.getValue();
                     closeRepository(repository);
-                    archiveRepositoryStats(repository, state.version());
                 } else {
                     survivors.put(entry.getKey(), entry.getValue());
                 }
@@ -485,7 +489,6 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
                             } else {
                                 logger.debug("updating repository [{}]", repositoryMetadata.name());
                                 closeRepository(repository);
-                                archiveRepositoryStats(repository, state.version());
                                 repository = null;
                                 try {
                                     repository = createRepository(repositoryMetadata, typesRegistry);
@@ -575,12 +578,12 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
     }
 
     public List<RepositoryStatsSnapshot> repositoriesStats() {
-        List<RepositoryStatsSnapshot> archivedRepoStats = repositoriesStatsArchive.getArchivedStats();
         List<RepositoryStatsSnapshot> activeRepoStats = getRepositoryStatsForActiveRepositories();
+        return activeRepoStats;
+    }
 
-        List<RepositoryStatsSnapshot> repositoriesStats = new ArrayList<>(archivedRepoStats);
-        repositoriesStats.addAll(activeRepoStats);
-        return repositoriesStats;
+    public RepositoriesStats getRepositoriesStats() {
+        return new RepositoriesStats(repositoriesStats());
     }
 
     private List<RepositoryStatsSnapshot> getRepositoryStatsForActiveRepositories() {
@@ -640,15 +643,6 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
         repository.close();
     }
 
-    private void archiveRepositoryStats(Repository repository, long clusterStateVersion) {
-        if (repository instanceof MeteredBlobStoreRepository) {
-            RepositoryStatsSnapshot stats = ((MeteredBlobStoreRepository) repository).statsSnapshotForArchival(clusterStateVersion);
-            if (repositoriesStatsArchive.archive(stats) == false) {
-                logger.warn("Unable to archive the repository stats [{}] as the archive is full.", stats);
-            }
-        }
-    }
-
     /**
      * Creates repository holder. This method starts the non-internal repository
      */
@@ -697,6 +691,17 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
         final String repositoryName,
         final Settings repositoryMetadataSettings
     ) {
+        validateRepositoryMetadataSettings(clusterService, repositoryName, repositoryMetadataSettings, null, null, null);
+    }
+
+    public static void validateRepositoryMetadataSettings(
+        ClusterService clusterService,
+        final String repositoryName,
+        final Settings repositoryMetadataSettings,
+        Map<String, Repository> repositories,
+        Settings settings,
+        RepositoriesService repositoriesService
+    ) {
         // We can add more validations here for repository settings in the future.
         Version minVersionInCluster = clusterService.state().getNodes().getMinNodeVersion();
         if (REMOTE_STORE_INDEX_SHALLOW_COPY.get(repositoryMetadataSettings) && !minVersionInCluster.onOrAfter(Version.V_2_9_0)) {
@@ -710,6 +715,57 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
                     + minVersionInCluster
             );
         }
+        if (SHALLOW_SNAPSHOT_V2.get(repositoryMetadataSettings)) {
+            if (repositories == null || repositoriesService == null || settings == null) {
+                throw new RepositoryException(
+                    repositoryName,
+                    "setting " + SHALLOW_SNAPSHOT_V2.getKey() + " cannot be enabled if required params are not provided"
+                );
+            }
+            if (minVersionInCluster.onOrAfter(Version.V_2_17_0) == false) {
+                throw new RepositoryException(
+                    repositoryName,
+                    "setting "
+                        + SHALLOW_SNAPSHOT_V2.getKey()
+                        + " cannot be enabled as some of the nodes in cluster are on version older than "
+                        + Version.V_2_17_0
+                        + ". Minimum node version in cluster is: "
+                        + minVersionInCluster
+                );
+            }
+            if (repositoryName.contains(SnapshotsService.SNAPSHOT_PINNED_TIMESTAMP_DELIMITER)) {
+                throw new RepositoryException(
+                    repositoryName,
+                    "setting "
+                        + SHALLOW_SNAPSHOT_V2.getKey()
+                        + " cannot be enabled for repository with "
+                        + SnapshotsService.SNAPSHOT_PINNED_TIMESTAMP_DELIMITER
+                        + " in the name as this delimiter is used to create pinning entity"
+                );
+            }
+            if (repositoryWithShallowV2Exists(repositories)) {
+                throw new RepositoryException(
+                    repositoryName,
+                    "setting "
+                        + SHALLOW_SNAPSHOT_V2.getKey()
+                        + " cannot be enabled as this setting can be enabled only on one repository "
+                        + " and one or more repositories in the cluster have the setting as enabled"
+                );
+            }
+            try {
+                if (pinnedTimestampExistsWithDifferentRepository(repositoryName, settings, repositoriesService)) {
+                    throw new RepositoryException(
+                        repositoryName,
+                        "setting "
+                            + SHALLOW_SNAPSHOT_V2.getKey()
+                            + " cannot be enabled if there are existing snapshots created with shallow V2 "
+                            + "setting using different repository."
+                    );
+                }
+            } catch (IOException e) {
+                throw new RepositoryException(repositoryName, "Exception while fetching pinned timestamp details");
+            }
+        }
         // Validation to not allow users to create system repository via put repository call.
         if (isSystemRepositorySettingPresent(repositoryMetadataSettings)) {
             throw new RepositoryException(
@@ -719,6 +775,28 @@ public class RepositoriesService extends AbstractLifecycleComponent implements C
                     + " cannot provide system repository setting; this setting is managed by OpenSearch"
             );
         }
+    }
+
+    private static boolean repositoryWithShallowV2Exists(Map<String, Repository> repositories) {
+        return repositories.values().stream().anyMatch(repo -> SHALLOW_SNAPSHOT_V2.get(repo.getMetadata().settings()));
+    }
+
+    private static boolean pinnedTimestampExistsWithDifferentRepository(
+        String newRepoName,
+        Settings settings,
+        RepositoriesService repositoriesService
+    ) throws IOException {
+        Map<String, Set<Long>> pinningEntityTimestampMap = RemoteStorePinnedTimestampService.fetchPinnedTimestamps(
+            settings,
+            repositoriesService
+        );
+        for (String pinningEntity : pinningEntityTimestampMap.keySet()) {
+            String repoNameWithPinnedTimestamps = pinningEntity.split(SnapshotsService.SNAPSHOT_PINNED_TIMESTAMP_DELIMITER)[0];
+            if (repoNameWithPinnedTimestamps.equals(newRepoName) == false) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void ensureRepositoryNotInUse(ClusterState clusterState, String repository) {

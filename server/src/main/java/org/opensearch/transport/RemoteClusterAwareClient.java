@@ -31,6 +31,8 @@
 
 package org.opensearch.transport;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionType;
@@ -53,6 +55,8 @@ final class RemoteClusterAwareClient extends AbstractClient {
     private final String clusterAlias;
     private final RemoteClusterService remoteClusterService;
 
+    protected final Logger logger = LogManager.getLogger(getClass());
+
     RemoteClusterAwareClient(Settings settings, ThreadPool threadPool, TransportService service, String clusterAlias) {
         super(settings, threadPool);
         this.service = service;
@@ -69,10 +73,12 @@ final class RemoteClusterAwareClient extends AbstractClient {
         remoteClusterService.ensureConnected(clusterAlias, ActionListener.wrap(v -> {
             Transport.Connection connection;
             if (request instanceof RemoteClusterAwareRequest) {
+                logger.info("Nishant: Here123");
                 DiscoveryNode preferredTargetNode = ((RemoteClusterAwareRequest) request).getPreferredTargetNode();
                 connection = remoteClusterService.getConnection(preferredTargetNode, clusterAlias);
             } else {
                 connection = remoteClusterService.getConnection(clusterAlias);
+                logger.info("Nishant: Here456" + connection.getNode().getName());
             }
             service.sendRequest(
                 connection,

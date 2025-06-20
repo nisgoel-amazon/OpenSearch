@@ -40,7 +40,6 @@ import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.common.annotation.PublicApi;
-import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
@@ -249,7 +248,7 @@ public final class RemoteClusterService extends RemoteClusterAware implements Cl
         return this.remoteClusters.keySet();
     }
 
-    @Override
+    /*@Override
     public void listenForUpdates(ClusterSettings clusterSettings) {
         super.listenForUpdates(clusterSettings);
         clusterSettings.addAffixUpdateConsumer(REMOTE_CLUSTER_SKIP_UNAVAILABLE, this::updateSkipUnavailable, (alias, value) -> {});
@@ -260,11 +259,12 @@ public final class RemoteClusterService extends RemoteClusterAware implements Cl
         if (remote != null) {
             remote.updateSkipUnavailable(skipUnavailable);
         }
-    }
+    }*/
 
     @Override
     protected void updateRemoteCluster(String clusterAlias, Settings settings) {
         CountDownLatch latch = new CountDownLatch(1);
+        logger.info("Nishant: here");
         updateRemoteCluster(clusterAlias, settings, ActionListener.wrap(latch::countDown));
 
         try {
@@ -292,12 +292,16 @@ public final class RemoteClusterService extends RemoteClusterAware implements Cl
         }
 
         RemoteClusterConnection remote = this.remoteClusters.get(clusterAlias);
+        logger.info("Nishant: list of new settings is " + newSettings);
+        boolean newSkipUnavailableValue = REMOTE_CLUSTER_SKIP_UNAVAILABLE.getConcreteSettingForNamespace(clusterAlias).get(newSettings);
+        logger.info("Nishant: skip unavailable value is " + newSkipUnavailableValue);
         if (RemoteConnectionStrategy.isConnectionEnabled(clusterAlias, newSettings) == false) {
             try {
                 IOUtils.close(remote);
             } catch (IOException e) {
                 logger.warn("failed to close remote cluster connections for cluster: " + clusterAlias, e);
             }
+            logger.info("Nishant: line number 303");
             remoteClusters.remove(clusterAlias);
             listener.onResponse(null);
             return;
@@ -307,9 +311,11 @@ public final class RemoteClusterService extends RemoteClusterAware implements Cl
             // this is a new cluster we have to add a new representation
             Settings finalSettings = Settings.builder().put(this.settings, false).put(newSettings, false).build();
             remote = new RemoteClusterConnection(finalSettings, clusterAlias, transportService);
+            logger.info("Nishant line 313: remote alias " + clusterAlias + " and skip value is " + remote.isSkipUnavailable());
+            logger.info("Nishant: line number 313");
             remoteClusters.put(clusterAlias, remote);
             remote.ensureConnected(listener);
-        } else if (remote.shouldRebuildConnection(newSettings)) {
+        } else if (remote.shouldRebuildConnection(newSettings) || newSkipUnavailableValue != remote.isSkipUnavailable()) {
             // Changes to connection configuration. Must tear down existing connection
             try {
                 IOUtils.close(remote);
@@ -319,10 +325,15 @@ public final class RemoteClusterService extends RemoteClusterAware implements Cl
             remoteClusters.remove(clusterAlias);
             Settings finalSettings = Settings.builder().put(this.settings, false).put(newSettings, false).build();
             remote = new RemoteClusterConnection(finalSettings, clusterAlias, transportService);
+            logger.info("Nishant: list of previous settings is " + this.settings);
+            logger.info("Nishant: list of final settings is " + finalSettings);
+            logger.info("Nishant line 326: remote alias " + clusterAlias + " and skip value is " + remote.isSkipUnavailable());
+            logger.info("Nishant: line number 326");
             remoteClusters.put(clusterAlias, remote);
             remote.ensureConnected(listener);
         } else {
             // No changes to connection configuration.
+            logger.info("Nishant: line number 331");
             listener.onResponse(null);
         }
     }

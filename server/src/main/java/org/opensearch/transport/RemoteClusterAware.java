@@ -144,6 +144,7 @@ public abstract class RemoteClusterAware {
     public void listenForUpdates(ClusterSettings clusterSettings) {
         List<Setting.AffixSetting<?>> remoteClusterSettings = Arrays.asList(
             RemoteClusterService.REMOTE_CLUSTER_COMPRESS,
+            RemoteClusterService.REMOTE_CLUSTER_SKIP_UNAVAILABLE,
             RemoteClusterService.REMOTE_CLUSTER_PING_SCHEDULE,
             RemoteConnectionStrategy.REMOTE_CONNECTION_MODE,
             SniffConnectionStrategy.REMOTE_CLUSTERS_PROXY,

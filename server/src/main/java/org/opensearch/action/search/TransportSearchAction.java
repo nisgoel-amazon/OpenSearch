@@ -32,6 +32,8 @@
 
 package org.opensearch.action.search;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsGroup;
@@ -162,6 +164,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         Setting.Property.Dynamic,
         Setting.Property.NodeScope
     );
+
+    private static final Logger logger = LogManager.getLogger(TransportSearchAction.class);
 
     private final NodeClient client;
     private final ThreadPool threadPool;
@@ -648,6 +652,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
             Map.Entry<String, OriginalIndices> entry = remoteIndices.entrySet().iterator().next();
             String clusterAlias = entry.getKey();
             boolean skipUnavailable = remoteClusterService.isSkipUnavailable(clusterAlias);
+            logger.info("Nishant: value of skipUnavailable is " + skipUnavailable);
             OriginalIndices indices = entry.getValue();
             SearchRequest ccsSearchRequest = SearchRequest.subSearchRequest(
                 searchRequest,

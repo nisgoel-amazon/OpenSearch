@@ -117,6 +117,7 @@ final class TransportKeepAlive implements Closeable {
         // The client-side initiates pings and the server-side responds. So if this is a client channel, this
         // method is a no-op.
         if (channel.isServerChannel()) {
+            logger.info("Nishant: Sending ping from server channel" + " " + channel.getLocalAddress().toString() + " " + channel.getRemoteAddress().toString());
             sendPing(channel);
         }
     }
